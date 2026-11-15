@@ -38,6 +38,8 @@ export default {
       // 1. Check for Authorization header
       const authHeader = request.headers.get("Authorization");
       const expectedToken = `Bearer ${env.API_SECRET}`;
+        console.log("Received header:", authHeader);
+    console.log("Expected secret exists:", !!env.API_SECRET);
 
       if (!authHeader || authHeader !== expectedToken) {
         return new Response(

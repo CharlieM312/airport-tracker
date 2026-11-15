@@ -12,7 +12,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // GET /api/visits - List all visits (optionally filtered by ?username=...)
+    // GET /api/visits - Public read access (anyone can view visits)
     if (request.method === "GET" && url.pathname === "/api/visits") {
       try {
         const username = url.searchParams.get("username");
@@ -33,8 +33,20 @@ export default {
       }
     }
 
-    // POST /api/visits - Log a new airport visit
+    // POST /api/visits - Protected write access (requires token)
     if (request.method === "POST" && url.pathname === "/api/visits") {
+      // 1. Check for Authorization header
+      const authHeader = request.headers.get("Authorization");
+      const expectedToken = `Bearer ${env.API_SECRET}`;
+
+      if (!authHeader || authHeader !== expectedToken) {
+        return new Response(
+          JSON.stringify({ error: "Unauthorized: Invalid or missing token" }),
+          { status: 401, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // 2. Proceed with database insertion if authorized
       try {
         const body = await request.json();
         const { iata_code, airport_name, visit_date, notes, username } = body;

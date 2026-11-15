@@ -84,12 +84,21 @@ Validates credentials (and `totp_code` if `totp_secret` is enabled on the user) 
 Clears the active `session_token` in D1 for the Bearer token sent in the `Authorization` header.
 
 ### 3. `GET /api/2fa/status` *(Protected)*
-Returns which 2FA methods are currently active for the signed-in user:
+Returns which 2FA methods and passkeys are currently active for the signed-in user:
 ```json
 {
   "username": "CharlieM312",
   "totp_enabled": true,
-  "webauthn_enabled": true
+  "webauthn_enabled": true,
+  "passkey_count": 2,
+  "passkeys": [
+    {
+      "id": 1,
+      "credential_id": "base64url-id-1",
+      "label": "Security Key #1",
+      "created_at": "2026-11-15 22:30:00"
+    }
+  ]
 }
 ```
 

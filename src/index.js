@@ -186,6 +186,63 @@ function getRpId(request, url) {
 }
 
 /**
+ * Ensure the `user_passkeys` table exists and return all registered passkeys for a username
+ * (including any credential stored in the legacy `users.webauthn_credential_id` column).
+ */
+async function getUserPasskeys(db, username) {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS user_passkeys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        credential_id TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        label TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`
+    )
+    .run();
+
+  const { results } = await db
+    .prepare(
+      "SELECT id, credential_id, public_key, label, created_at FROM user_passkeys WHERE username = ? ORDER BY id ASC"
+    )
+    .bind(username)
+    .all();
+
+  const passkeys = [...(results || [])];
+
+  // Also include the legacy single-column credential on `users` if not already in `user_passkeys`
+  try {
+    const legacyUser = await db
+      .prepare(
+        "SELECT webauthn_credential_id, webauthn_public_key FROM users WHERE username = ?"
+      )
+      .bind(username)
+      .first();
+
+    if (
+      legacyUser &&
+      legacyUser.webauthn_credential_id &&
+      legacyUser.webauthn_public_key &&
+      !passkeys.some((k) => k.credential_id === legacyUser.webauthn_credential_id)
+    ) {
+      passkeys.unshift({
+        id: 0,
+        credential_id: legacyUser.webauthn_credential_id,
+        public_key: legacyUser.webauthn_public_key,
+        label: "Primary Security Key",
+        created_at: null,
+      });
+    }
+  } catch {
+    // Ignore if legacy columns are not present
+  }
+
+  return passkeys;
+}
+
+/**
  * Calculate great-circle distance between two coordinates using the Haversine formula.
  */
 function calculateDistanceKm(lat1, lon1, lat2, lon2) {
@@ -421,13 +478,13 @@ export default {
     }
 
     // =========================================================================
-    // GET /api/2fa/status - Check enabled 2FA methods for current user (Protected)
+    // GET /api/2fa/status - Check enabled 2FA methods & passkeys for current user (Protected)
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/2fa/status") {
       const { user, errorResponse } = await authenticateRequest(request, env, db);
       if (errorResponse) return errorResponse;
       if (!user.username) {
-        return jsonResponse({ totp_enabled: false, webauthn_enabled: false });
+        return jsonResponse({ totp_enabled: false, webauthn_enabled: false, passkeys: [] });
       }
 
       try {
@@ -438,10 +495,19 @@ export default {
           .bind(user.username)
           .first();
 
+        const passkeys = await getUserPasskeys(db, user.username);
+
         return jsonResponse({
           username: user.username,
           totp_enabled: Boolean(record && record.totp_secret),
-          webauthn_enabled: Boolean(record && record.webauthn_credential_id),
+          webauthn_enabled: passkeys.length > 0,
+          passkey_count: passkeys.length,
+          passkeys: passkeys.map((k, idx) => ({
+            id: k.id,
+            credential_id: k.credential_id,
+            label: k.label || `Security Key #${idx + 1}`,
+            created_at: k.created_at,
+          })),
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -620,13 +686,39 @@ export default {
               .run();
           }
         } else if (targetType === "webauthn") {
+          const credentialIdToDelete = url.searchParams.get("credential_id");
+          await getUserPasskeys(db, user.username);
+          if (credentialIdToDelete) {
+            await db
+              .prepare(
+                "DELETE FROM user_passkeys WHERE username = ? AND credential_id = ?"
+              )
+              .bind(user.username, credentialIdToDelete)
+              .run();
+            await db
+              .prepare(
+                "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL WHERE username = ? AND webauthn_credential_id = ?"
+              )
+              .bind(user.username, credentialIdToDelete)
+              .run();
+          } else {
+            await db
+              .prepare("DELETE FROM user_passkeys WHERE username = ?")
+              .bind(user.username)
+              .run();
+            await db
+              .prepare(
+                "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+              )
+              .bind(user.username)
+              .run();
+          }
+        } else {
+          await getUserPasskeys(db, user.username);
           await db
-            .prepare(
-              "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
-            )
+            .prepare("DELETE FROM user_passkeys WHERE username = ?")
             .bind(user.username)
             .run();
-        } else {
           try {
             await db
               .prepare(
@@ -673,6 +765,8 @@ export default {
           .bind(challenge, user.username)
           .run();
 
+        const existingKeys = await getUserPasskeys(db, user.username);
+
         return jsonResponse({
           challenge,
           rpId: getRpId(request, url),
@@ -680,6 +774,10 @@ export default {
             { alg: -7, type: "public-key" },
             { alg: -257, type: "public-key" },
           ],
+          excludeCredentials: existingKeys.map((k) => ({
+            id: k.credential_id,
+            type: "public-key",
+          })),
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -700,7 +798,7 @@ export default {
       }
 
       try {
-        const { credential_id, public_key } = await request.json();
+        const { credential_id, public_key, label } = await request.json();
         if (!credential_id || !public_key) {
           return jsonResponse(
             { error: "Missing required fields: credential_id and public_key" },
@@ -708,6 +806,21 @@ export default {
           );
         }
 
+        const existingKeys = await getUserPasskeys(db, user.username);
+        const keyLabel = label || `Security Key #${existingKeys.length + 1}`;
+
+        await db
+          .prepare(
+            `INSERT INTO user_passkeys (username, credential_id, public_key, label)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(credential_id) DO UPDATE SET
+               public_key = excluded.public_key,
+               label = COALESCE(excluded.label, user_passkeys.label)`
+          )
+          .bind(user.username, credential_id, public_key, keyLabel)
+          .run();
+
+        // Also keep users.webauthn_credential_id updated for backwards compatibility
         await db
           .prepare(
             "UPDATE users SET webauthn_credential_id = ?, webauthn_public_key = ?, webauthn_challenge = NULL WHERE username = ?"
@@ -715,14 +828,19 @@ export default {
           .bind(credential_id, public_key, user.username)
           .run();
 
-        return jsonResponse({ success: true });
+        const updatedKeys = await getUserPasskeys(db, user.username);
+
+        return jsonResponse({
+          success: true,
+          passkey_count: updatedKeys.length,
+        });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
     // =========================================================================
-    // POST /api/webauthn/login-options - Issue challenge for YubiKey sign-in
+    // POST /api/webauthn/login-options - Issue challenge for YubiKey / Passkey sign-in
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/webauthn/login-options") {
       try {
@@ -738,7 +856,15 @@ export default {
           .bind(username)
           .first();
 
-        if (!user || !user.webauthn_credential_id) {
+        if (!user) {
+          return jsonResponse(
+            { error: "No YubiKey or security key registered for this user" },
+            { status: 400 }
+          );
+        }
+
+        const passkeys = await getUserPasskeys(db, user.username);
+        if (passkeys.length === 0) {
           return jsonResponse(
             { error: "No YubiKey or security key registered for this user" },
             { status: 400 }
@@ -759,7 +885,11 @@ export default {
         return jsonResponse({
           challenge,
           rpId: getRpId(request, url),
-          allowCredentials: [{ id: user.webauthn_credential_id, type: "public-key" }],
+          allowCredentials: passkeys.map((k) => ({
+            id: k.credential_id,
+            type: "public-key",
+            transports: ["usb", "nfc", "ble", "internal", "hybrid"],
+          })),
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -767,7 +897,7 @@ export default {
     }
 
     // =========================================================================
-    // POST /api/webauthn/login-verify - Verify YubiKey ECDSA signature & issue session token
+    // POST /api/webauthn/login-verify - Verify YubiKey / Passkey signature & issue session token
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/webauthn/login-verify") {
       try {
@@ -793,15 +923,22 @@ export default {
         }
 
         const user = await db
-          .prepare(
-            "SELECT * FROM users WHERE username = ? AND webauthn_credential_id = ?"
-          )
-          .bind(username, credential_id)
+          .prepare("SELECT * FROM users WHERE username = ?")
+          .bind(username)
           .first();
 
-        if (!user || !user.webauthn_public_key || !user.webauthn_challenge) {
+        if (!user || !user.webauthn_challenge) {
           return jsonResponse(
             { error: "Invalid security key login state" },
+            { status: 401 }
+          );
+        }
+
+        const passkeys = await getUserPasskeys(db, user.username);
+        const matchedKey = passkeys.find((k) => k.credential_id === credential_id);
+        if (!matchedKey || !matchedKey.public_key) {
+          return jsonResponse(
+            { error: "Unrecognized security key or passkey for this user" },
             { status: 401 }
           );
         }
@@ -820,7 +957,7 @@ export default {
         signedData.set(authDataBytes, 0);
         signedData.set(clientDataHash, authDataBytes.length);
 
-        const spkiBytes = base64UrlToBytes(user.webauthn_public_key);
+        const spkiBytes = base64UrlToBytes(matchedKey.public_key);
         const sigBytes = base64UrlToBytes(signature);
         let isValid = false;
 

@@ -24,7 +24,8 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 | `username` | `TEXT NOT NULL UNIQUE` | Unique username (e.g., `CharlieM312`) |
 | `password` | `TEXT NOT NULL` | User password |
 | `session_token` | `TEXT` | Active session token issued by `POST /api/login` or `POST /api/webauthn/login-verify` |
-| `totp_secret` | `TEXT` | Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
+| `totp_secret` | `TEXT` | Active Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
+| `totp_pending_secret` | `TEXT` | Unverified Base32 TOTP secret awaiting 6-digit code confirmation |
 | `webauthn_credential_id` | `TEXT` | Base64URL-encoded WebAuthn credential ID for YubiKey / Passkey |
 | `webauthn_public_key` | `TEXT` | Base64URL-encoded SPKI ECDSA P-256 public key |
 | `webauthn_challenge` | `TEXT` | Ephemeral WebAuthn challenge for registration or sign-in |
@@ -82,8 +83,26 @@ Validates credentials (and `totp_code` if `totp_secret` is enabled on the user) 
 ### 2. `POST /api/logout`
 Clears the active `session_token` in D1 for the Bearer token sent in the `Authorization` header.
 
-### 3. `POST /api/2fa/totp/setup` *(Protected)*
-Generates a Base32 TOTP secret, saves it to `users.totp_secret` for the signed-in user, and returns `{ secret, otpauth_url, qr_code_url }` so the frontend can display a scannable QR code for Microsoft Authenticator or Yubico Authenticator.
+### 3. `GET /api/2fa/status` *(Protected)*
+Returns which 2FA methods are currently active for the signed-in user:
+```json
+{
+  "username": "CharlieM312",
+  "totp_enabled": true,
+  "webauthn_enabled": true
+}
+```
+
+### 4. `POST /api/2fa/totp/setup` & `POST /api/2fa/totp/verify` *(Protected)*
+Two-step enrollment for Microsoft Authenticator / Yubico Authenticator so the user cannot be locked out before confirming their app generates valid codes:
+1. **`POST /api/2fa/totp/setup`**: Generates a Base32 secret, stores it in `users.totp_pending_secret`, and returns `{ secret, otpauth_url, pending_verification: true }`.
+2. **`POST /api/2fa/totp/verify`**: Accepts `{ "code": "123456" }` (or `{ "totp_code": "123456" }`), verifies it against `totp_pending_secret`, and promotes it to `users.totp_secret` (`{ "success": true, "totp_enabled": true }`).
+
+### 5. `DELETE /api/2fa/totp`, `DELETE /api/webauthn`, & `DELETE /api/2fa` *(Protected)*
+Remove/disable 2FA methods for the signed-in user:
+- `DELETE /api/2fa/totp` (or `POST /api/2fa/totp/disable`): Clears `totp_secret` and `totp_pending_secret`.
+- `DELETE /api/webauthn` (or `DELETE /api/2fa/webauthn`): Clears `webauthn_credential_id`, `webauthn_public_key`, and `webauthn_challenge`.
+- `DELETE /api/2fa`: Disables both TOTP and WebAuthn (or pass `{ "type": "totp" | "webauthn" | "all" }`).
 
 ### 4. `POST /api/webauthn/register-options` & `POST /api/webauthn/register-verify` *(Protected)*
 Enrolls a YubiKey / FIDO2 security key for the signed-in user:

@@ -2,13 +2,18 @@
  * Airport Tracker Worker API
  *
  * Authentication & 2FA / WebAuthn Endpoints:
- * - POST /api/login                     (Validates username, password, and optional 6-digit TOTP code)
- * - POST /api/logout                    (Clears the active session_token in `users`)
- * - POST /api/2fa/totp/setup            (Protected: generates Base32 TOTP secret & otpauth:// URI)
- * - POST /api/webauthn/register-options (Protected: generates challenge to enroll a YubiKey / Passkey)
- * - POST /api/webauthn/register-verify  (Protected: saves YubiKey credential_id & SPKI public_key)
- * - POST /api/webauthn/login-options    (Public: generates challenge & allowCredentials for YubiKey sign-in)
- * - POST /api/webauthn/login-verify     (Public: verifies YubiKey ECDSA P-256 signature & issues session token)
+ * - POST   /api/login                     (Validates username, password, and optional 6-digit TOTP code)
+ * - POST   /api/logout                    (Clears the active session_token in `users`)
+ * - GET    /api/2fa/status                (Protected: returns { totp_enabled, webauthn_enabled })
+ * - POST   /api/2fa/totp/setup            (Protected: generates pending Base32 TOTP secret & otpauth:// URI)
+ * - POST   /api/2fa/totp/verify           (Protected: verifies a 6-digit code and activates totp_secret)
+ * - DELETE /api/2fa/totp                  (Protected: disables Authenticator TOTP 2FA)
+ * - DELETE /api/webauthn                  (Protected: removes registered YubiKey / security key)
+ * - DELETE /api/2fa                       (Protected: disables TOTP, WebAuthn, or both)
+ * - POST   /api/webauthn/register-options (Protected: generates challenge to enroll a YubiKey / Passkey)
+ * - POST   /api/webauthn/register-verify  (Protected: saves YubiKey credential_id & SPKI public_key)
+ * - POST   /api/webauthn/login-options    (Public: generates challenge & allowCredentials for YubiKey sign-in)
+ * - POST   /api/webauthn/login-verify     (Public: verifies YubiKey ECDSA P-256 signature & issues session token)
  *
  * Public Read Endpoints:
  * - GET /api/visits          (?username=&limit=&before=)
@@ -416,7 +421,35 @@ export default {
     }
 
     // =========================================================================
-    // POST /api/2fa/totp/setup - Generate & save Base32 TOTP secret (Protected)
+    // GET /api/2fa/status - Check enabled 2FA methods for current user (Protected)
+    // =========================================================================
+    if (request.method === "GET" && url.pathname === "/api/2fa/status") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse({ totp_enabled: false, webauthn_enabled: false });
+      }
+
+      try {
+        const record = await db
+          .prepare(
+            "SELECT totp_secret, webauthn_credential_id FROM users WHERE username = ?"
+          )
+          .bind(user.username)
+          .first();
+
+        return jsonResponse({
+          username: user.username,
+          totp_enabled: Boolean(record && record.totp_secret),
+          webauthn_enabled: Boolean(record && record.webauthn_credential_id),
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/2fa/totp/setup - Generate pending Base32 TOTP secret (Protected)
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/2fa/totp/setup") {
       const { user, errorResponse } = await authenticateRequest(request, env, db);
@@ -430,10 +463,19 @@ export default {
 
       try {
         const secret = generateBase32Secret(20);
-        await db
-          .prepare("UPDATE users SET totp_secret = ? WHERE username = ?")
-          .bind(secret, user.username)
-          .run();
+        try {
+          // Save to totp_pending_secret so the user is not locked out until they verify a 6-digit code
+          await db
+            .prepare("UPDATE users SET totp_pending_secret = ? WHERE username = ?")
+            .bind(secret, user.username)
+            .run();
+        } catch {
+          // Fallback if totp_pending_secret column wasn't added yet
+          await db
+            .prepare("UPDATE users SET totp_secret = ? WHERE username = ?")
+            .bind(secret, user.username)
+            .run();
+        }
 
         const otpauthUrl = `otpauth://totp/AirportTracker:${encodeURIComponent(
           user.username
@@ -443,6 +485,168 @@ export default {
           success: true,
           secret,
           otpauth_url: otpauthUrl,
+          pending_verification: true,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/2fa/totp/verify - Verify 6-digit code & activate TOTP 2FA (Protected)
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/2fa/totp/verify") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to verify 2FA" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const body = await request.json();
+        const code = body.code || body.totp_code;
+        if (!code) {
+          return jsonResponse(
+            { error: "Please enter the 6-digit code from your Authenticator app" },
+            { status: 400 }
+          );
+        }
+
+        let record;
+        try {
+          record = await db
+            .prepare(
+              "SELECT totp_pending_secret, totp_secret FROM users WHERE username = ?"
+            )
+            .bind(user.username)
+            .first();
+        } catch {
+          record = await db
+            .prepare("SELECT totp_secret FROM users WHERE username = ?")
+            .bind(user.username)
+            .first();
+        }
+
+        const candidateSecret =
+          (record && record.totp_pending_secret) || (record && record.totp_secret);
+        if (!candidateSecret) {
+          return jsonResponse(
+            { error: "No pending Authenticator setup found. Click Setup first." },
+            { status: 400 }
+          );
+        }
+
+        const isValid = await verifyTotp(candidateSecret, code);
+        if (!isValid) {
+          return jsonResponse(
+            { error: "Invalid 6-digit code. Check your Authenticator app and try again." },
+            { status: 400 }
+          );
+        }
+
+        try {
+          await db
+            .prepare(
+              "UPDATE users SET totp_secret = ?, totp_pending_secret = NULL WHERE username = ?"
+            )
+            .bind(candidateSecret, user.username)
+            .run();
+        } catch {
+          await db
+            .prepare("UPDATE users SET totp_secret = ? WHERE username = ?")
+            .bind(candidateSecret, user.username)
+            .run();
+        }
+
+        return jsonResponse({
+          success: true,
+          totp_enabled: true,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // DELETE /api/2fa/totp, DELETE /api/webauthn, DELETE /api/2fa - Remove 2FA (Protected)
+    // =========================================================================
+    if (
+      (request.method === "DELETE" &&
+        (url.pathname === "/api/2fa/totp" ||
+          url.pathname === "/api/2fa/webauthn" ||
+          url.pathname === "/api/webauthn" ||
+          url.pathname === "/api/2fa")) ||
+      (request.method === "POST" && url.pathname === "/api/2fa/totp/disable")
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to manage 2FA" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        let targetType = "all";
+        if (url.pathname === "/api/2fa/totp" || url.pathname === "/api/2fa/totp/disable") {
+          targetType = "totp";
+        } else if (url.pathname === "/api/2fa/webauthn" || url.pathname === "/api/webauthn") {
+          targetType = "webauthn";
+        } else {
+          try {
+            const body = await request.json();
+            if (body && body.type) targetType = body.type;
+          } catch {
+            // Default to disabling all 2FA if no JSON body was provided on DELETE /api/2fa
+          }
+        }
+
+        if (targetType === "totp") {
+          try {
+            await db
+              .prepare(
+                "UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL WHERE username = ?"
+              )
+              .bind(user.username)
+              .run();
+          } catch {
+            await db
+              .prepare("UPDATE users SET totp_secret = NULL WHERE username = ?")
+              .bind(user.username)
+              .run();
+          }
+        } else if (targetType === "webauthn") {
+          await db
+            .prepare(
+              "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+            )
+            .bind(user.username)
+            .run();
+        } else {
+          try {
+            await db
+              .prepare(
+                "UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL, webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+              )
+              .bind(user.username)
+              .run();
+          } catch {
+            await db
+              .prepare(
+                "UPDATE users SET totp_secret = NULL, webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+              )
+              .bind(user.username)
+              .run();
+          }
+        }
+
+        return jsonResponse({
+          success: true,
+          disabled: targetType,
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });

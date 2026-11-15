@@ -676,6 +676,10 @@ export default {
         return jsonResponse({
           challenge,
           rpId: getRpId(request, url),
+          pubKeyCredParams: [
+            { alg: -7, type: "public-key" },
+            { alg: -257, type: "public-key" },
+          ],
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -816,20 +820,41 @@ export default {
         signedData.set(authDataBytes, 0);
         signedData.set(clientDataHash, authDataBytes.length);
 
-        const pubKey = await crypto.subtle.importKey(
-          "spki",
-          base64UrlToBytes(user.webauthn_public_key),
-          { name: "ECDSA", namedCurve: "P-256" },
-          false,
-          ["verify"]
-        );
+        const spkiBytes = base64UrlToBytes(user.webauthn_public_key);
+        const sigBytes = base64UrlToBytes(signature);
+        let isValid = false;
 
-        const isValid = await crypto.subtle.verify(
-          { name: "ECDSA", hash: "SHA-256" },
-          pubKey,
-          derToP1363Signature(base64UrlToBytes(signature)),
-          signedData
-        );
+        try {
+          // 1. Try ES256 (ECDSA P-256, alg: -7)
+          const ecKey = await crypto.subtle.importKey(
+            "spki",
+            spkiBytes,
+            { name: "ECDSA", namedCurve: "P-256" },
+            false,
+            ["verify"]
+          );
+          isValid = await crypto.subtle.verify(
+            { name: "ECDSA", hash: "SHA-256" },
+            ecKey,
+            derToP1363Signature(sigBytes),
+            signedData
+          );
+        } catch {
+          // 2. Fallback to RS256 (RSASSA-PKCS1-v1_5 SHA-256, alg: -257)
+          const rsaKey = await crypto.subtle.importKey(
+            "spki",
+            spkiBytes,
+            { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+            false,
+            ["verify"]
+          );
+          isValid = await crypto.subtle.verify(
+            { name: "RSASSA-PKCS1-v1_5" },
+            rsaKey,
+            sigBytes,
+            signedData
+          );
+        }
 
         if (!isValid) {
           return jsonResponse(

@@ -32,13 +32,33 @@ export default {
         return Response.json({ error: err.message }, { status: 500 });
       }
     }
+    // GET /api/visits/airports - Public read access (anyone can view airports)
+    if (request.method === "GET" && url.pathname === "/api/visits/airports") {
+      try {
+        const username = url.searchParams.get("username");
+        let query = "SELECT iata_code FROM airport_visits";
+        let params = [];
+
+        if (username) {
+          query += " WHERE username = ?";
+          params.push(username);
+        }
+
+        query += " ORDER BY visit_date DESC";
+
+        const { results } = await env.DB.prepare(query).bind(...params).all();
+        return Response.json(results);
+      } catch (err) {
+        return Response.json({ error: err.message }, { status: 500 });
+      }
+    }
 
     // POST /api/visits - Protected write access (requires token)
     if (request.method === "POST" && url.pathname === "/api/visits") {
       // 1. Check for Authorization header
       const authHeader = request.headers.get("Authorization");
       const expectedToken = `Bearer ${env.API_SECRET}`;
-        console.log("Received header:", authHeader);
+      console.log("Received header:", authHeader);
     console.log("Expected secret exists:", !!env.API_SECRET);
 
       if (!authHeader || authHeader !== expectedToken) {
@@ -71,6 +91,50 @@ export default {
             username || null
           )
           .run();
+
+        return Response.json({ success: true, changes: info.meta.changes });
+      } catch (err) {
+        return Response.json({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // Delete /api/visits - Protected delete access (requires token)
+    if (request.method === "DELETE" && url.pathname === "/api/visits") {
+      // 1. Check for Authorization header
+      const authHeader = request.headers.get("Authorization");
+      const expectedToken = `Bearer ${env.API_SECRET}`;
+
+      if (!authHeader || authHeader !== expectedToken) {
+        return new Response(
+          JSON.stringify({ error: "Unauthorized: Invalid or missing token" }),
+          { status: 401, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // 2. Proceed with database deletion if authorized
+      try {
+        const body = await request.json();
+        const { id } = body;
+
+        if (!id) {
+          return new Response(
+            JSON.stringify({ error: "Missing required field: id" }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
+        }
+
+        const info = await env.DB.prepare(
+          "DELETE FROM airport_visits WHERE id = ?"
+        )
+          .bind(id)
+          .run();
+
+        if (info.meta.changes === 0) {
+          return new Response(
+            JSON.stringify({ error: "No record found with the provided id" }),
+            { status: 404, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
         return Response.json({ success: true, changes: info.meta.changes });
       } catch (err) {

@@ -752,6 +752,51 @@ export default {
     }
 
     // =========================================================================
+    // PATCH /api/webauthn/edit-options - Edit label for a registered YubiKey / Passkey (Protected)
+    // =========================================================================
+    if (request.method === "PATCH" && url.pathname === "/api/webauthn/edit-options") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to edit a security key" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const { credential_id, label } = await request.json();
+        if (!credential_id || !label) {
+          return jsonResponse(
+            { error: "Missing required fields: credential_id and label" },
+            { status: 400 }
+          );
+        }
+
+        const result = await db
+          .prepare(
+            "UPDATE user_passkeys SET label = ? WHERE username = ? AND credential_id = ?"
+          )
+          .bind(label, user.username, credential_id)
+          .run();
+
+        if (result.changes === 0) {
+          return jsonResponse(
+            { error: "No matching security key found for this user" },
+            { status: 404 }
+          );
+        }
+
+        return jsonResponse({
+          success: true,
+          updated: { credential_id, label },
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
     // POST /api/webauthn/register-verify - Save YubiKey credential_id & SPKI public_key (Protected)
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/webauthn/register-verify") {

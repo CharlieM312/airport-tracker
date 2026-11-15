@@ -110,13 +110,13 @@ Two-step enrollment for Microsoft Authenticator / Yubico Authenticator so the us
 ### 5. `DELETE /api/2fa/totp`, `DELETE /api/webauthn`, & `DELETE /api/2fa` *(Protected)*
 Remove/disable 2FA methods for the signed-in user:
 - `DELETE /api/2fa/totp` (or `POST /api/2fa/totp/disable`): Clears `totp_secret` and `totp_pending_secret`.
-- `DELETE /api/webauthn` (or `DELETE /api/2fa/webauthn`): Clears `webauthn_credential_id`, `webauthn_public_key`, and `webauthn_challenge`.
+- `DELETE /api/webauthn?credential_id=<id>` (or JSON body `{ "credential_id": "<id>" }`): Deletes a specific passkey from `user_passkeys`. Calling `DELETE /api/webauthn` without `credential_id` removes all registered passkeys for the user.
 - `DELETE /api/2fa`: Disables both TOTP and WebAuthn (or pass `{ "type": "totp" | "webauthn" | "all" }`).
 
-### 4. `POST /api/webauthn/register-options` & `POST /api/webauthn/register-verify` *(Protected)*
-Enrolls a YubiKey / FIDO2 security key for the signed-in user:
-- `POST /api/webauthn/register-options` returns `{ challenge, rpId }`.
-- `POST /api/webauthn/register-verify` accepts `{ credential_id, public_key }` (SPKI Base64URL) and saves them to `users`.
+### 6. `POST /api/webauthn/register-options` & `POST /api/webauthn/register-verify` *(Protected)*
+Enrolls a YubiKey / FIDO2 security key or passkey for the signed-in user (multiple passkeys per user supported):
+- `POST /api/webauthn/register-options` returns `{ challenge, rpId, pubKeyCredParams, excludeCredentials }`.
+- `POST /api/webauthn/register-verify` accepts `{ credential_id, public_key, label? }` (SPKI Base64URL) and adds it to `user_passkeys`, returning `{ success: true, passkey_count }`.
 
 ### 5. `POST /api/webauthn/login-options` & `POST /api/webauthn/login-verify` *(Public)*
 Authenticates a user with their enrolled YubiKey / security key:

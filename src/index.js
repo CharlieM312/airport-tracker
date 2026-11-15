@@ -658,17 +658,19 @@ export default {
 
       try {
         let targetType = "all";
+        let bodyData = null;
+        try {
+          bodyData = await request.json();
+        } catch {
+          // Optional JSON body
+        }
+
         if (url.pathname === "/api/2fa/totp" || url.pathname === "/api/2fa/totp/disable") {
           targetType = "totp";
         } else if (url.pathname === "/api/2fa/webauthn" || url.pathname === "/api/webauthn") {
           targetType = "webauthn";
-        } else {
-          try {
-            const body = await request.json();
-            if (body && body.type) targetType = body.type;
-          } catch {
-            // Default to disabling all 2FA if no JSON body was provided on DELETE /api/2fa
-          }
+        } else if (bodyData && bodyData.type) {
+          targetType = bodyData.type;
         }
 
         if (targetType === "totp") {
@@ -686,7 +688,10 @@ export default {
               .run();
           }
         } else if (targetType === "webauthn") {
-          const credentialIdToDelete = url.searchParams.get("credential_id");
+          const credentialIdToDelete =
+            url.searchParams.get("credential_id") ||
+            (bodyData && bodyData.credential_id) ||
+            null;
           await getUserPasskeys(db, user.username);
           if (credentialIdToDelete) {
             await db

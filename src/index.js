@@ -1,14 +1,18 @@
 /**
  * Airport Tracker Worker API
  *
+ * Authentication Endpoints:
+ * - POST /api/login          (Validates username & password against `users`, returns session token)
+ * - POST /api/logout         (Clears the active session_token in `users`)
+ *
  * Public Read Endpoints:
  * - GET /api/visits          (?username=&limit=&before=)
  * - GET /api/visits/airports (?username=&distinct=true)
  * - GET /api/stats           (?username=)
  * - GET /api/airports        (?code=LHR or ?search=London)
  *
- * Protected Write Endpoints (Authorization: Bearer <API_SECRET>):
- * - POST   /api/visits       (Single visit insert; auto-populates airport_name & distance_km)
+ * Protected Write Endpoints (Authorization: Bearer <session_token>):
+ * - POST   /api/visits       (Single visit insert; uses authenticated user's username)
  * - POST   /api/visits/batch (Bulk insert visits using D1 db.batch())
  * - PATCH  /api/visits       (or PATCH /api/visits/:id — update an existing visit)
  * - DELETE /api/visits       (or DELETE /api/visits/:id — delete a visit)
@@ -17,6 +21,20 @@
 
 const EARTH_RADIUS_KM = 6371;
 const KM_TO_MILES = 0.621371;
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, x-d1-bookmark",
+};
+
+function jsonResponse(data, init = {}) {
+  const headers = {
+    ...CORS_HEADERS,
+    ...(init.headers || {}),
+  };
+  return Response.json(data, { ...init, headers });
+}
 
 /**
  * Calculate great-circle distance between two coordinates using the Haversine formula.
@@ -45,12 +63,52 @@ function calculateDistanceKm(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Verify Bearer token authorization.
+ * Verify Bearer token against `users.session_token` in D1 (with fallback to env.API_SECRET).
+ * Returns `{ user, errorResponse }`.
  */
-function isAuthorized(request, env) {
+async function authenticateRequest(request, env, db) {
   const authHeader = request.headers.get("Authorization");
-  const expectedToken = `Bearer ${env.API_SECRET}`;
-  return Boolean(env.API_SECRET && authHeader && authHeader === expectedToken);
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return {
+      user: null,
+      errorResponse: jsonResponse({ error: "Unauthorized: Missing token" }, { status: 401 }),
+    };
+  }
+
+  const token = authHeader.slice("Bearer ".length).trim();
+  if (!token) {
+    return {
+      user: null,
+      errorResponse: jsonResponse({ error: "Unauthorized: Missing token" }, { status: 401 }),
+    };
+  }
+
+  // 1. Check session_token in D1 `users` table
+  try {
+    const user = await db
+      .prepare("SELECT id, username FROM users WHERE session_token = ?")
+      .bind(token)
+      .first();
+
+    if (user) {
+      return { user, errorResponse: null };
+    }
+  } catch {
+    // If users table does not exist yet, fall through to API_SECRET check
+  }
+
+  // 2. Fallback: allow static env.API_SECRET for CLI / administrative tasks if configured
+  if (env.API_SECRET && token === env.API_SECRET) {
+    return { user: { username: null, isApiSecret: true }, errorResponse: null };
+  }
+
+  return {
+    user: null,
+    errorResponse: jsonResponse(
+      { error: "Unauthorized: Invalid or expired session" },
+      { status: 401 }
+    ),
+  };
 }
 
 /**
@@ -112,6 +170,11 @@ async function lookupAirportsMap(db, codes) {
 
 export default {
   async fetch(request, env, ctx) {
+    // Handle CORS preflight requests
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
     const url = new URL(request.url);
     const cache = caches.default;
 
@@ -120,11 +183,75 @@ export default {
     const db = typeof env.DB.withSession === "function" ? env.DB.withSession(bookmark) : env.DB;
 
     const cacheHeaders = () => ({
+      ...CORS_HEADERS,
       "Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=600",
       ...(typeof db.getBookmark === "function" && db.getBookmark()
         ? { "x-d1-bookmark": db.getBookmark() }
         : {}),
     });
+
+    // =========================================================================
+    // POST /api/login - Validate credentials and issue a session token
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/login") {
+      try {
+        const { username, password } = await request.json();
+
+        if (!username || !password) {
+          return jsonResponse(
+            { error: "Username and password are required" },
+            { status: 400 }
+          );
+        }
+
+        const user = await db
+          .prepare("SELECT * FROM users WHERE username = ? AND password = ?")
+          .bind(username, password)
+          .first();
+
+        if (!user) {
+          return jsonResponse(
+            { error: "Invalid username or password" },
+            { status: 401 }
+          );
+        }
+
+        const sessionToken = crypto.randomUUID();
+        await db
+          .prepare("UPDATE users SET session_token = ? WHERE username = ?")
+          .bind(sessionToken, user.username)
+          .run();
+
+        return jsonResponse({
+          success: true,
+          token: sessionToken,
+          username: user.username,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/logout - Clear active session token
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/logout") {
+      try {
+        const authHeader = request.headers.get("Authorization");
+        if (authHeader && authHeader.startsWith("Bearer ")) {
+          const token = authHeader.slice("Bearer ".length).trim();
+          if (token) {
+            await db
+              .prepare("UPDATE users SET session_token = NULL WHERE session_token = ?")
+              .bind(token)
+              .run();
+          }
+        }
+        return jsonResponse({ success: true });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
 
     // =========================================================================
     // GET /api/visits - Public read access (with airport metadata join)
@@ -193,7 +320,7 @@ export default {
         ctx.waitUntil(cache.put(request, response.clone()));
         return response;
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -230,7 +357,7 @@ export default {
         ctx.waitUntil(cache.put(request, response.clone()));
         return response;
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -381,7 +508,7 @@ export default {
         ctx.waitUntil(cache.put(request, response.clone()));
         return response;
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -415,7 +542,7 @@ export default {
         ctx.waitUntil(cache.put(request, response.clone()));
         return response;
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -423,16 +550,15 @@ export default {
     // POST /api/airports - Add or batch-upsert reference airports (Protected)
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/airports") {
-      if (!isAuthorized(request, env)) {
-        return Response.json({ error: "Unauthorized: Invalid or missing token" }, { status: 401 });
-      }
+      const { errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
 
       try {
         const body = await request.json();
         const items = Array.isArray(body) ? body : Array.isArray(body.airports) ? body.airports : [body];
 
         if (items.length === 0) {
-          return Response.json({ error: "No airport records provided" }, { status: 400 });
+          return jsonResponse({ error: "No airport records provided" }, { status: 400 });
         }
 
         const stmt = db.prepare(
@@ -449,7 +575,7 @@ export default {
         const batchStatements = [];
         for (const item of items) {
           if (!item.iata_code || !item.name || item.latitude == null || item.longitude == null) {
-            return Response.json(
+            return jsonResponse(
               { error: "Each airport requires iata_code, name, latitude, and longitude" },
               { status: 400 }
             );
@@ -470,26 +596,28 @@ export default {
         const totalChanges = results.reduce((acc, r) => acc + (r.meta?.changes || 0), 0);
 
         ctx.waitUntil(cache.delete(`${url.origin}/api/airports`));
-        return Response.json({ success: true, count: batchStatements.length, changes: totalChanges });
+        return jsonResponse({ success: true, count: batchStatements.length, changes: totalChanges });
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
     // =========================================================================
-    // POST /api/visits - Single visit insert (Protected)
+    // POST /api/visits - Single visit insert (Protected by session_token)
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/visits") {
-      if (!isAuthorized(request, env)) {
-        return Response.json({ error: "Unauthorized: Invalid or missing token" }, { status: 401 });
-      }
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
 
       try {
         const body = await request.json();
-        const { iata_code, airport_name, visit_date, notes, username, origin_iata, flight_number } = body;
+        const { iata_code, airport_name, visit_date, notes, origin_iata, flight_number } = body;
+
+        // Automatically use the authenticated user's username (fallback to body.username for API_SECRET)
+        const username = user.username || body.username || null;
 
         if (!iata_code || !visit_date) {
-          return Response.json(
+          return jsonResponse(
             { error: "Missing required fields: iata_code and visit_date" },
             { status: 400 }
           );
@@ -502,7 +630,7 @@ export default {
         const airportMap = await lookupAirportsMap(db, [destCode, origCode]);
         const destAirport = airportMap.get(destCode);
         if (!destAirport) {
-          return Response.json(
+          return jsonResponse(
             { error: `Invalid or unknown iata_code '${destCode}'. It must match an airport in /api/airports.` },
             { status: 400 }
           );
@@ -510,7 +638,7 @@ export default {
 
         const origAirport = origCode ? airportMap.get(origCode) : null;
         if (origCode && !origAirport) {
-          return Response.json(
+          return jsonResponse(
             { error: `Invalid or unknown origin_iata '${origCode}'. It must match an airport in /api/airports.` },
             { status: 400 }
           );
@@ -540,7 +668,7 @@ export default {
               resolvedName,
               visit_date,
               notes || null,
-              username || null,
+              username,
               origCode,
               flight_number || null,
               distanceKm
@@ -552,21 +680,22 @@ export default {
             .prepare(
               "INSERT INTO airport_visits (iata_code, airport_name, visit_date, notes, username) VALUES (?, ?, ?, ?, ?)"
             )
-            .bind(destCode, resolvedName, visit_date, notes || null, username || null)
+            .bind(destCode, resolvedName, visit_date, notes || null, username)
             .run();
         }
 
         ctx.waitUntil(invalidateVisitCaches(cache, url.origin, [username]));
 
-        return Response.json({
+        return jsonResponse({
           success: true,
           id: info.meta.last_row_id,
+          username,
           airport_name: resolvedName,
           distance_km: distanceKm,
           changes: info.meta.changes,
         });
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -574,26 +703,24 @@ export default {
     // POST /api/visits/batch - Bulk insert visits via D1 db.batch() (Protected)
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/visits/batch") {
-      if (!isAuthorized(request, env)) {
-        return Response.json({ error: "Unauthorized: Invalid or missing token" }, { status: 401 });
-      }
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
 
       try {
         const body = await request.json();
         const visits = Array.isArray(body) ? body : body.visits;
 
         if (!Array.isArray(visits) || visits.length === 0) {
-          return Response.json(
+          return jsonResponse(
             { error: "Request body must contain a non-empty 'visits' array" },
             { status: 400 }
           );
         }
 
-        // Collect all IATA codes across the batch to resolve names & coordinates in one query
         const allCodes = [];
         for (const v of visits) {
           if (!v.iata_code || !v.visit_date) {
-            return Response.json(
+            return jsonResponse(
               { error: "Every visit in batch must include iata_code and visit_date" },
               { status: 400 }
             );
@@ -617,7 +744,7 @@ export default {
           const origCode = v.origin_iata ? String(v.origin_iata).trim().toUpperCase() : null;
           const destAirport = airportMap.get(destCode);
           if (!destAirport) {
-            return Response.json(
+            return jsonResponse(
               { error: `Invalid or unknown iata_code '${destCode}'. It must match an airport in /api/airports.` },
               { status: 400 }
             );
@@ -625,7 +752,7 @@ export default {
 
           const origAirport = origCode ? airportMap.get(origCode) : null;
           if (origCode && !origAirport) {
-            return Response.json(
+            return jsonResponse(
               { error: `Invalid or unknown origin_iata '${origCode}'. It must match an airport in /api/airports.` },
               { status: 400 }
             );
@@ -642,7 +769,8 @@ export default {
                 )
               : null;
 
-          if (v.username) affectedUsers.add(v.username);
+          const resolvedUsername = user.username || v.username || null;
+          if (resolvedUsername) affectedUsers.add(resolvedUsername);
 
           statements.push(
             insertStmt.bind(
@@ -650,7 +778,7 @@ export default {
               resolvedName,
               v.visit_date,
               v.notes || null,
-              v.username || null,
+              resolvedUsername,
               origCode,
               v.flight_number || null,
               distanceKm
@@ -663,13 +791,13 @@ export default {
 
         ctx.waitUntil(invalidateVisitCaches(cache, url.origin, [...affectedUsers]));
 
-        return Response.json({
+        return jsonResponse({
           success: true,
           inserted: totalInserted,
           batch_size: statements.length,
         });
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -680,9 +808,8 @@ export default {
       (request.method === "PATCH" || request.method === "PUT") &&
       (url.pathname === "/api/visits" || url.pathname.startsWith("/api/visits/"))
     ) {
-      if (!isAuthorized(request, env)) {
-        return Response.json({ error: "Unauthorized: Invalid or missing token" }, { status: 401 });
-      }
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
 
       try {
         const pathId = url.pathname.startsWith("/api/visits/")
@@ -692,7 +819,7 @@ export default {
         const visitId = pathId || body.id;
 
         if (!visitId) {
-          return Response.json({ error: "Missing required field: id" }, { status: 400 });
+          return jsonResponse({ error: "Missing required field: id" }, { status: 400 });
         }
 
         const existing = await db
@@ -701,7 +828,7 @@ export default {
           .first();
 
         if (!existing) {
-          return Response.json({ error: "No record found with the provided id" }, { status: 404 });
+          return jsonResponse({ error: "No record found with the provided id" }, { status: 404 });
         }
 
         const nextIata = body.iata_code
@@ -717,7 +844,7 @@ export default {
         const airportMap = await lookupAirportsMap(db, [nextIata, nextOrigin]);
         const destAirport = airportMap.get(nextIata);
         if (!destAirport) {
-          return Response.json(
+          return jsonResponse(
             { error: `Invalid or unknown iata_code '${nextIata}'. It must match an airport in /api/airports.` },
             { status: 400 }
           );
@@ -725,7 +852,7 @@ export default {
 
         const origAirport = nextOrigin ? airportMap.get(nextOrigin) : null;
         if (nextOrigin && !origAirport) {
-          return Response.json(
+          return jsonResponse(
             { error: `Invalid or unknown origin_iata '${nextOrigin}'. It must match an airport in /api/airports.` },
             { status: 400 }
           );
@@ -751,7 +878,8 @@ export default {
 
         const nextVisitDate = body.visit_date ?? existing.visit_date;
         const nextNotes = body.notes !== undefined ? body.notes : existing.notes;
-        const nextUsername = body.username !== undefined ? body.username : existing.username;
+        const nextUsername =
+          user.username || (body.username !== undefined ? body.username : existing.username);
         const nextFlightNumber =
           body.flight_number !== undefined ? body.flight_number : existing.flight_number;
 
@@ -785,14 +913,14 @@ export default {
           invalidateVisitCaches(cache, url.origin, [existing.username, nextUsername])
         );
 
-        return Response.json({
+        return jsonResponse({
           success: true,
           id: Number(visitId),
           changes: info.meta.changes,
           distance_km: nextDistanceKm,
         });
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
@@ -803,9 +931,8 @@ export default {
       request.method === "DELETE" &&
       (url.pathname === "/api/visits" || url.pathname.startsWith("/api/visits/"))
     ) {
-      if (!isAuthorized(request, env)) {
-        return Response.json({ error: "Unauthorized: Invalid or missing token" }, { status: 401 });
-      }
+      const { errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
 
       try {
         const pathId = url.pathname.startsWith("/api/visits/")
@@ -815,7 +942,7 @@ export default {
         const id = pathId || body.id;
 
         if (!id) {
-          return Response.json({ error: "Missing required field: id" }, { status: 400 });
+          return jsonResponse({ error: "Missing required field: id" }, { status: 400 });
         }
 
         const info = await db
@@ -824,7 +951,7 @@ export default {
           .run();
 
         if (info.meta.changes === 0) {
-          return Response.json(
+          return jsonResponse(
             { error: "No record found with the provided id" },
             { status: 404 }
           );
@@ -832,15 +959,15 @@ export default {
 
         ctx.waitUntil(invalidateVisitCaches(cache, url.origin));
 
-        return Response.json({ success: true, changes: info.meta.changes });
+        return jsonResponse({ success: true, changes: info.meta.changes });
       } catch (err) {
-        return Response.json({ error: err.message }, { status: 500 });
+        return jsonResponse({ error: err.message }, { status: 500 });
       }
     }
 
     return new Response(
-      "Airport Tracker API is running. Endpoints: GET/POST/PATCH/DELETE /api/visits, POST /api/visits/batch, GET /api/stats, GET/POST /api/airports",
-      { status: 200 }
+      "Airport Tracker API is running. Endpoints: POST /api/login, GET/POST/PATCH/DELETE /api/visits, POST /api/visits/batch, GET /api/stats, GET/POST /api/airports",
+      { status: 200, headers: CORS_HEADERS }
     );
   },
 };

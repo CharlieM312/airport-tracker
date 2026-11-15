@@ -28,4 +28,5 @@ npx wrangler deploy
 - `migrations/0001_init.sql` — Initial `airport_visits` table schema.
 - `migrations/0002_add_indexes.sql` — Indexes for date sorting (`idx_visits_date`) and user-filtered queries (`idx_visits_user_date`).
 - `migrations/0003_airports_and_flights.sql` — `airports` reference table with UK & international airport coordinates, foreign key constraints, and flight leg columns (`origin_iata`, `flight_number`, `distance_km`).
+- `migrations/0004_users_and_sessions.sql` — `users` table with `username`, `password`, and indexed `session_token` for database-backed authentication.
 - `wrangler.jsonc` — Cloudflare Worker & D1 binding configuration.

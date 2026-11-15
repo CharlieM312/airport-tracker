@@ -186,15 +186,14 @@ function getRpId(request, url) {
 }
 
 /**
- * Ensure the `user_passkeys` table exists and return all registered passkeys for a username
- * (including any credential stored in the legacy `users.webauthn_credential_id` column).
+ * Ensure the `user_passkeys` table exists and return all registered passkeys for a username.
  */
 async function getUserPasskeys(db, username) {
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS user_passkeys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
+        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
         credential_id TEXT NOT NULL UNIQUE,
         public_key TEXT NOT NULL,
         label TEXT,
@@ -210,36 +209,7 @@ async function getUserPasskeys(db, username) {
     .bind(username)
     .all();
 
-  const passkeys = [...(results || [])];
-
-  // Also include the legacy single-column credential on `users` if not already in `user_passkeys`
-  try {
-    const legacyUser = await db
-      .prepare(
-        "SELECT webauthn_credential_id, webauthn_public_key FROM users WHERE username = ?"
-      )
-      .bind(username)
-      .first();
-
-    if (
-      legacyUser &&
-      legacyUser.webauthn_credential_id &&
-      legacyUser.webauthn_public_key &&
-      !passkeys.some((k) => k.credential_id === legacyUser.webauthn_credential_id)
-    ) {
-      passkeys.unshift({
-        id: 0,
-        credential_id: legacyUser.webauthn_credential_id,
-        public_key: legacyUser.webauthn_public_key,
-        label: "Primary Security Key",
-        created_at: null,
-      });
-    }
-  } catch {
-    // Ignore if legacy columns are not present
-  }
-
-  return passkeys;
+  return results || [];
 }
 
 /**
@@ -489,9 +459,7 @@ export default {
 
       try {
         const record = await db
-          .prepare(
-            "SELECT totp_secret, webauthn_credential_id FROM users WHERE username = ?"
-          )
+          .prepare("SELECT totp_secret FROM users WHERE username = ?")
           .bind(user.username)
           .first();
 
@@ -700,12 +668,6 @@ export default {
               )
               .bind(user.username, credentialIdToDelete)
               .run();
-            await db
-              .prepare(
-                "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL WHERE username = ? AND webauthn_credential_id = ?"
-              )
-              .bind(user.username, credentialIdToDelete)
-              .run();
           } else {
             await db
               .prepare("DELETE FROM user_passkeys WHERE username = ?")
@@ -713,7 +675,7 @@ export default {
               .run();
             await db
               .prepare(
-                "UPDATE users SET webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+                "UPDATE users SET webauthn_challenge = NULL WHERE username = ?"
               )
               .bind(user.username)
               .run();
@@ -727,14 +689,14 @@ export default {
           try {
             await db
               .prepare(
-                "UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL, webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+                "UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL, webauthn_challenge = NULL WHERE username = ?"
               )
               .bind(user.username)
               .run();
           } catch {
             await db
               .prepare(
-                "UPDATE users SET totp_secret = NULL, webauthn_credential_id = NULL, webauthn_public_key = NULL, webauthn_challenge = NULL WHERE username = ?"
+                "UPDATE users SET totp_secret = NULL, webauthn_challenge = NULL WHERE username = ?"
               )
               .bind(user.username)
               .run();
@@ -825,12 +787,9 @@ export default {
           .bind(user.username, credential_id, public_key, keyLabel)
           .run();
 
-        // Also keep users.webauthn_credential_id updated for backwards compatibility
         await db
-          .prepare(
-            "UPDATE users SET webauthn_credential_id = ?, webauthn_public_key = ?, webauthn_challenge = NULL WHERE username = ?"
-          )
-          .bind(credential_id, public_key, user.username)
+          .prepare("UPDATE users SET webauthn_challenge = NULL WHERE username = ?")
+          .bind(user.username)
           .run();
 
         const updatedKeys = await getUserPasskeys(db, user.username);
@@ -855,9 +814,7 @@ export default {
         }
 
         const user = await db
-          .prepare(
-            "SELECT username, password, webauthn_credential_id FROM users WHERE username = ?"
-          )
+          .prepare("SELECT username, password FROM users WHERE username = ?")
           .bind(username)
           .first();
 

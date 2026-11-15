@@ -26,10 +26,18 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 | `session_token` | `TEXT` | Active session token issued by `POST /api/login` or `POST /api/webauthn/login-verify` |
 | `totp_secret` | `TEXT` | Active Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
 | `totp_pending_secret` | `TEXT` | Unverified Base32 TOTP secret awaiting 6-digit code confirmation |
-| `webauthn_credential_id` | `TEXT` | Base64URL-encoded WebAuthn credential ID for YubiKey / Passkey |
-| `webauthn_public_key` | `TEXT` | Base64URL-encoded SPKI ECDSA P-256 public key |
 | `webauthn_challenge` | `TEXT` | Ephemeral WebAuthn challenge for registration or sign-in |
 | `created_at` | `DATETIME` | Timestamp when the user was created |
+
+### `user_passkeys`
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `INTEGER PRIMARY KEY` | Auto-incrementing passkey ID |
+| `username` | `TEXT NOT NULL` | Foreign key referencing `users(username)` |
+| `credential_id` | `TEXT NOT NULL UNIQUE` | Base64URL-encoded WebAuthn credential ID |
+| `public_key` | `TEXT NOT NULL` | Base64URL-encoded SPKI (`ES256` or `RS256`) public key |
+| `label` | `TEXT` | User-friendly name (e.g., `YubiKey 5 NFC`, `Security Key #1`) |
+| `created_at` | `DATETIME` | Timestamp when the passkey was registered |
 
 ### `airports` (Reference Table)
 | Column | Type | Description |

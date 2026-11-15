@@ -23,7 +23,11 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 | `id` | `INTEGER PRIMARY KEY` | Auto-incrementing user ID |
 | `username` | `TEXT NOT NULL UNIQUE` | Unique username (e.g., `CharlieM312`) |
 | `password` | `TEXT NOT NULL` | User password |
-| `session_token` | `TEXT` | Active session token issued by `POST /api/login` (indexed via `idx_users_session_token`) |
+| `session_token` | `TEXT` | Active session token issued by `POST /api/login` or `POST /api/webauthn/login-verify` |
+| `totp_secret` | `TEXT` | Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
+| `webauthn_credential_id` | `TEXT` | Base64URL-encoded WebAuthn credential ID for YubiKey / Passkey |
+| `webauthn_public_key` | `TEXT` | Base64URL-encoded SPKI ECDSA P-256 public key |
+| `webauthn_challenge` | `TEXT` | Ephemeral WebAuthn challenge for registration or sign-in |
 | `created_at` | `DATETIME` | Timestamp when the user was created |
 
 ### `airports` (Reference Table)
@@ -55,13 +59,14 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 ## Authentication Endpoints
 
 ### 1. `POST /api/login`
-Validates credentials and generates a new `session_token`.
+Validates credentials (and `totp_code` if `totp_secret` is enabled on the user) and generates a new `session_token`.
 
 **Request Body:**
 ```json
 {
   "username": "CharlieM312",
-  "password": "your-password"
+  "password": "your-password",
+  "totp_code": "123456"
 }
 ```
 
@@ -76,6 +81,19 @@ Validates credentials and generates a new `session_token`.
 
 ### 2. `POST /api/logout`
 Clears the active `session_token` in D1 for the Bearer token sent in the `Authorization` header.
+
+### 3. `POST /api/2fa/totp/setup` *(Protected)*
+Generates a Base32 TOTP secret, saves it to `users.totp_secret` for the signed-in user, and returns `{ secret, otpauth_url, qr_code_url }` so the frontend can display a scannable QR code for Microsoft Authenticator or Yubico Authenticator.
+
+### 4. `POST /api/webauthn/register-options` & `POST /api/webauthn/register-verify` *(Protected)*
+Enrolls a YubiKey / FIDO2 security key for the signed-in user:
+- `POST /api/webauthn/register-options` returns `{ challenge, rpId }`.
+- `POST /api/webauthn/register-verify` accepts `{ credential_id, public_key }` (SPKI Base64URL) and saves them to `users`.
+
+### 5. `POST /api/webauthn/login-options` & `POST /api/webauthn/login-verify` *(Public)*
+Authenticates a user with their enrolled YubiKey / security key:
+- `POST /api/webauthn/login-options` accepts `{ username, password? }` and returns `{ challenge, rpId, allowCredentials }`.
+- `POST /api/webauthn/login-verify` verifies the ECDSA P-256 signature over `authenticatorData || SHA-256(clientDataJSON)` using Web Crypto and returns `{ success: true, token, username }`.
 
 ---
 

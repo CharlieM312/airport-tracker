@@ -1,9 +1,14 @@
 /**
  * Airport Tracker Worker API
  *
- * Authentication Endpoints:
- * - POST /api/login          (Validates username & password against `users`, returns session token)
- * - POST /api/logout         (Clears the active session_token in `users`)
+ * Authentication & 2FA / WebAuthn Endpoints:
+ * - POST /api/login                     (Validates username, password, and optional 6-digit TOTP code)
+ * - POST /api/logout                    (Clears the active session_token in `users`)
+ * - POST /api/2fa/totp/setup            (Protected: generates Base32 TOTP secret & otpauth:// URI)
+ * - POST /api/webauthn/register-options (Protected: generates challenge to enroll a YubiKey / Passkey)
+ * - POST /api/webauthn/register-verify  (Protected: saves YubiKey credential_id & SPKI public_key)
+ * - POST /api/webauthn/login-options    (Public: generates challenge & allowCredentials for YubiKey sign-in)
+ * - POST /api/webauthn/login-verify     (Public: verifies YubiKey ECDSA P-256 signature & issues session token)
  *
  * Public Read Endpoints:
  * - GET /api/visits          (?username=&limit=&before=)
@@ -21,6 +26,7 @@
 
 const EARTH_RADIUS_KM = 6371;
 const KM_TO_MILES = 0.621371;
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -34,6 +40,144 @@ function jsonResponse(data, init = {}) {
     ...(init.headers || {}),
   };
   return Response.json(data, { ...init, headers });
+}
+
+// ============================================================================
+// TOTP & WebAuthn Cryptographic Helpers (Web Crypto API)
+// ============================================================================
+
+function generateBase32Secret(byteLength = 20) {
+  const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return output;
+}
+
+function base32ToBytes(base32) {
+  const cleaned = String(base32 || "")
+    .toUpperCase()
+    .replace(/=+$/, "")
+    .replace(/\s+/g, "");
+  let bits = 0;
+  let value = 0;
+  const bytes = [];
+  for (const char of cleaned) {
+    const idx = BASE32_ALPHABET.indexOf(char);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+async function generateTotpCode(secretBase32, counter) {
+  const keyBytes = base32ToBytes(secretBase32);
+  const counterBytes = new ArrayBuffer(8);
+  const view = new DataView(counterBytes);
+  view.setUint32(4, counter, false);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"]
+  );
+  const hmac = new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, counterBytes));
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const binary =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(binary % 1_000_000).padStart(6, "0");
+}
+
+async function verifyTotp(secretBase32, code) {
+  const cleanCode = String(code || "").trim();
+  if (!/^\d{6}$/.test(cleanCode)) return false;
+  const currentStep = Math.floor(Date.now() / 30000);
+  // Allow +/- 1 time step (30s window) for clock drift
+  for (const offset of [-1, 0, 1]) {
+    if ((await generateTotpCode(secretBase32, currentStep + offset)) === cleanCode) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function base64UrlToBytes(base64Url) {
+  const str = String(base64Url || "");
+  const padding = "=".repeat((4 - (str.length % 4)) % 4);
+  const base64 = (str + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = raw.charCodeAt(i);
+  }
+  return out;
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Convert WebAuthn ASN.1 DER ECDSA signature into 64-byte IEEE P1363 (r || s) format for Web Crypto.
+ */
+function derToP1363Signature(derBytes) {
+  let offset = 2;
+  if (derBytes[1] & 0x80) {
+    offset += derBytes[1] & 0x7f;
+  }
+  const rLen = derBytes[offset + 1];
+  let r = derBytes.slice(offset + 2, offset + 2 + rLen);
+  offset += 2 + rLen;
+  const sLen = derBytes[offset + 1];
+  let s = derBytes.slice(offset + 2, offset + 2 + sLen);
+
+  if (r.length > 32) r = r.slice(r.length - 32);
+  if (s.length > 32) s = s.slice(s.length - 32);
+
+  const raw = new Uint8Array(64);
+  raw.set(r, 32 - r.length);
+  raw.set(s, 64 - s.length);
+  return raw;
+}
+
+/**
+ * Determine the Relying Party ID (rpId) from the browser Origin header (fallback to request URL hostname).
+ */
+function getRpId(request, url) {
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    try {
+      return new URL(origin).hostname;
+    } catch {
+      // Fallback to url.hostname
+    }
+  }
+  return url.hostname;
 }
 
 /**
@@ -191,11 +335,12 @@ export default {
     });
 
     // =========================================================================
-    // POST /api/login - Validate credentials and issue a session token
+    // POST /api/login - Validate credentials (+ optional TOTP) & issue session token
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/login") {
       try {
-        const { username, password } = await request.json();
+        const body = await request.json();
+        const { username, password, totp_code } = body;
 
         if (!username || !password) {
           return jsonResponse(
@@ -214,6 +359,23 @@ export default {
             { error: "Invalid username or password" },
             { status: 401 }
           );
+        }
+
+        // If user has enrolled Microsoft/Yubico Authenticator TOTP, verify the 6-digit code
+        if (user.totp_secret) {
+          if (!totp_code) {
+            return jsonResponse(
+              { error: "6-digit Authenticator code required", requires_totp: true },
+              { status: 401 }
+            );
+          }
+          const isValidTotp = await verifyTotp(user.totp_secret, totp_code);
+          if (!isValidTotp) {
+            return jsonResponse(
+              { error: "Invalid 6-digit Authenticator code" },
+              { status: 401 }
+            );
+          }
         }
 
         const sessionToken = crypto.randomUUID();
@@ -248,6 +410,243 @@ export default {
           }
         }
         return jsonResponse({ success: true });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/2fa/totp/setup - Generate & save Base32 TOTP secret (Protected)
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/2fa/totp/setup") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to set up 2FA" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const secret = generateBase32Secret(20);
+        await db
+          .prepare("UPDATE users SET totp_secret = ? WHERE username = ?")
+          .bind(secret, user.username)
+          .run();
+
+        const otpauthUrl = `otpauth://totp/AirportTracker:${encodeURIComponent(
+          user.username
+        )}?secret=${secret}&issuer=AirportTracker`;
+
+        return jsonResponse({
+          success: true,
+          secret,
+          otpauth_url: otpauthUrl,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/webauthn/register-options - Start YubiKey / Passkey enrollment (Protected)
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/webauthn/register-options") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to register a security key" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const challenge = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+        await db
+          .prepare("UPDATE users SET webauthn_challenge = ? WHERE username = ?")
+          .bind(challenge, user.username)
+          .run();
+
+        return jsonResponse({
+          challenge,
+          rpId: getRpId(request, url),
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/webauthn/register-verify - Save YubiKey credential_id & SPKI public_key (Protected)
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/webauthn/register-verify") {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to register a security key" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const { credential_id, public_key } = await request.json();
+        if (!credential_id || !public_key) {
+          return jsonResponse(
+            { error: "Missing required fields: credential_id and public_key" },
+            { status: 400 }
+          );
+        }
+
+        await db
+          .prepare(
+            "UPDATE users SET webauthn_credential_id = ?, webauthn_public_key = ?, webauthn_challenge = NULL WHERE username = ?"
+          )
+          .bind(credential_id, public_key, user.username)
+          .run();
+
+        return jsonResponse({ success: true });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/webauthn/login-options - Issue challenge for YubiKey sign-in
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/webauthn/login-options") {
+      try {
+        const { username, password } = await request.json();
+        if (!username) {
+          return jsonResponse({ error: "Username is required" }, { status: 400 });
+        }
+
+        const user = await db
+          .prepare(
+            "SELECT username, password, webauthn_credential_id FROM users WHERE username = ?"
+          )
+          .bind(username)
+          .first();
+
+        if (!user || !user.webauthn_credential_id) {
+          return jsonResponse(
+            { error: "No YubiKey or security key registered for this user" },
+            { status: 400 }
+          );
+        }
+
+        // If password was also supplied by the user, verify it matches
+        if (password !== undefined && password !== "" && user.password !== password) {
+          return jsonResponse({ error: "Invalid username or password" }, { status: 401 });
+        }
+
+        const challenge = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+        await db
+          .prepare("UPDATE users SET webauthn_challenge = ? WHERE username = ?")
+          .bind(challenge, user.username)
+          .run();
+
+        return jsonResponse({
+          challenge,
+          rpId: getRpId(request, url),
+          allowCredentials: [{ id: user.webauthn_credential_id, type: "public-key" }],
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/webauthn/login-verify - Verify YubiKey ECDSA signature & issue session token
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/webauthn/login-verify") {
+      try {
+        const {
+          username,
+          credential_id,
+          authenticator_data,
+          client_data_json,
+          signature,
+        } = await request.json();
+
+        if (
+          !username ||
+          !credential_id ||
+          !authenticator_data ||
+          !client_data_json ||
+          !signature
+        ) {
+          return jsonResponse(
+            { error: "Missing required WebAuthn assertion fields" },
+            { status: 400 }
+          );
+        }
+
+        const user = await db
+          .prepare(
+            "SELECT * FROM users WHERE username = ? AND webauthn_credential_id = ?"
+          )
+          .bind(username, credential_id)
+          .first();
+
+        if (!user || !user.webauthn_public_key || !user.webauthn_challenge) {
+          return jsonResponse(
+            { error: "Invalid security key login state" },
+            { status: 401 }
+          );
+        }
+
+        const clientDataBytes = base64UrlToBytes(client_data_json);
+        const clientData = JSON.parse(new TextDecoder().decode(clientDataBytes));
+        if (clientData.challenge !== user.webauthn_challenge) {
+          return jsonResponse({ error: "Challenge mismatch" }, { status: 401 });
+        }
+
+        const authDataBytes = base64UrlToBytes(authenticator_data);
+        const clientDataHash = new Uint8Array(
+          await crypto.subtle.digest("SHA-256", clientDataBytes)
+        );
+        const signedData = new Uint8Array(authDataBytes.length + clientDataHash.length);
+        signedData.set(authDataBytes, 0);
+        signedData.set(clientDataHash, authDataBytes.length);
+
+        const pubKey = await crypto.subtle.importKey(
+          "spki",
+          base64UrlToBytes(user.webauthn_public_key),
+          { name: "ECDSA", namedCurve: "P-256" },
+          false,
+          ["verify"]
+        );
+
+        const isValid = await crypto.subtle.verify(
+          { name: "ECDSA", hash: "SHA-256" },
+          pubKey,
+          derToP1363Signature(base64UrlToBytes(signature)),
+          signedData
+        );
+
+        if (!isValid) {
+          return jsonResponse(
+            { error: "Security key signature verification failed" },
+            { status: 401 }
+          );
+        }
+
+        const sessionToken = crypto.randomUUID();
+        await db
+          .prepare(
+            "UPDATE users SET session_token = ?, webauthn_challenge = NULL WHERE username = ?"
+          )
+          .bind(sessionToken, user.username)
+          .run();
+
+        return jsonResponse({
+          success: true,
+          token: sessionToken,
+          username: user.username,
+        });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
       }
@@ -966,7 +1365,7 @@ export default {
     }
 
     return new Response(
-      "Airport Tracker API is running. Endpoints: POST /api/login, GET/POST/PATCH/DELETE /api/visits, POST /api/visits/batch, GET /api/stats, GET/POST /api/airports",
+      "Airport Tracker API is running. Endpoints: POST /api/login, POST /api/2fa/totp/setup, POST /api/webauthn/*, GET/POST/PATCH/DELETE /api/visits, GET /api/stats, GET/POST /api/airports",
       { status: 200, headers: CORS_HEADERS }
     );
   },

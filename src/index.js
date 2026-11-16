@@ -228,6 +228,26 @@ const SUPPORTED_OAUTH_PROVIDERS = ["github", "google", "microsoft", "apple"];
  * Ensure `user_oauth_accounts` and `oauth_states` tables exist.
  */
 async function ensureOAuthTables(db) {
+  try {
+    await db
+      .prepare("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+      .run();
+  } catch {
+    // Column already exists
+  }
+  try {
+    await db
+      .prepare("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+      .run();
+  } catch {
+    // Column already exists
+  }
+  try {
+    await db.prepare("ALTER TABLE users ADD COLUMN email TEXT").run();
+  } catch {
+    // Column already exists
+  }
+
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS user_oauth_accounts (
@@ -971,12 +991,39 @@ export default {
         }
 
         // 1. Check if this OAuth account is already linked to a user
-        const existingOAuth = await db
+        let existingOAuth = await db
           .prepare(
             "SELECT * FROM user_oauth_accounts WHERE provider = ? AND provider_user_id = ?"
           )
           .bind(provider, providerUserId)
           .first();
+
+        // Auto-link verified GitHub code login if the GitHub username matches an existing approved admin account (e.g. CharlieM312)
+        if (!existingOAuth && body.code && displayName) {
+          const matchingAdmin = await db
+            .prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)")
+            .bind(displayName)
+            .first();
+
+          if (matchingAdmin && isUserAdmin(matchingAdmin)) {
+            await db
+              .prepare(
+                `INSERT INTO user_oauth_accounts (username, provider, provider_user_id, email, display_name)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(provider, provider_user_id) DO UPDATE SET username = excluded.username`
+              )
+              .bind(
+                matchingAdmin.username,
+                provider,
+                providerUserId,
+                email,
+                displayName
+              )
+              .run();
+
+            existingOAuth = { username: matchingAdmin.username };
+          }
+        }
 
         if (existingOAuth) {
           const user = await db

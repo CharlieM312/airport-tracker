@@ -446,6 +446,68 @@ async function exchangeGitHubCode(code, redirectUri, env) {
 }
 
 /**
+ * Exchange a Microsoft (Entra / Personal) OAuth authorization `code` for an `id_token` / profile.
+ */
+async function exchangeMicrosoftCode(code, redirectUri, env) {
+  if (!env.MICROSOFT_CLIENT_ID || !env.MICROSOFT_CLIENT_SECRET) {
+    throw new Error(
+      "MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET must be configured on the Worker"
+    );
+  }
+
+  const form = new URLSearchParams({
+    client_id: env.MICROSOFT_CLIENT_ID,
+    client_secret: env.MICROSOFT_CLIENT_SECRET,
+    code: String(code).trim(),
+    grant_type: "authorization_code",
+    scope: "openid profile email User.Read",
+  });
+  if (redirectUri) {
+    form.set("redirect_uri", redirectUri);
+  }
+
+  const tokenRes = await fetch(
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form.toString(),
+    }
+  );
+
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || (!tokenData.id_token && !tokenData.access_token)) {
+    throw new Error(
+      tokenData.error_description ||
+        tokenData.error ||
+        "Failed to exchange Microsoft OAuth code"
+    );
+  }
+
+  if (tokenData.id_token) {
+    return decodeAndValidateIdToken(tokenData.id_token, "microsoft", env);
+  }
+
+  const graphRes = await fetch("https://graph.microsoft.com/v1.0/me", {
+    headers: {
+      Authorization: `Bearer ${tokenData.access_token}`,
+    },
+  });
+  const msUser = await graphRes.json();
+  if (!graphRes.ok || !msUser || !msUser.id) {
+    throw new Error("Failed to fetch Microsoft user profile");
+  }
+
+  return {
+    provider_user_id: String(msUser.id),
+    email: msUser.mail || msUser.userPrincipalName || null,
+    display_name: msUser.displayName || msUser.userPrincipalName || null,
+  };
+}
+
+/**
  * Generate a unique username in `users` from a desired name / email / OAuth login.
  */
 async function resolveUniqueUsername(db, rawBaseName) {
@@ -975,6 +1037,18 @@ export default {
           displayName = displayName || ghIdentity.display_name;
         }
 
+        // If a Microsoft OAuth authorization code was provided, exchange it for the Microsoft user profile
+        if (provider === "microsoft" && body.code) {
+          const msIdentity = await exchangeMicrosoftCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || msIdentity.provider_user_id;
+          email = email || msIdentity.email;
+          displayName = displayName || msIdentity.display_name;
+        }
+
         // If an OpenID Connect id_token JWT was provided (Google, Microsoft, Apple), decode & validate its claims
         if (body.id_token) {
           const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
@@ -983,19 +1057,32 @@ export default {
           displayName = displayName || tokenIdentity.display_name;
         }
 
+        if (!email && providerUserId.includes("@")) {
+          email = providerUserId;
+        }
+        if (!providerUserId && email) {
+          providerUserId = email;
+        }
+
         if (!providerUserId) {
           return jsonResponse(
-            { error: "Missing OAuth identity (code, id_token, or provider_user_id)" },
+            { error: "Missing OAuth identity (code, id_token, email, or provider_user_id)" },
             { status: 400 }
           );
         }
 
-        // 1. Check if this OAuth account is already linked to a user
+        // 1. Check if this OAuth account is already linked to a user (by provider_user_id or email)
         let existingOAuth = await db
           .prepare(
-            "SELECT * FROM user_oauth_accounts WHERE provider = ? AND provider_user_id = ?"
+            `SELECT * FROM user_oauth_accounts
+             WHERE provider = ?
+               AND (
+                 LOWER(provider_user_id) = LOWER(?)
+                 OR (? IS NOT NULL AND email IS NOT NULL AND LOWER(email) = LOWER(?))
+                 OR (? IS NOT NULL AND LOWER(provider_user_id) = LOWER(?))
+               )`
           )
-          .bind(provider, providerUserId)
+          .bind(provider, providerUserId, email, email, email, email)
           .first();
 
         // Auto-link verified GitHub code login if the GitHub username matches an existing approved admin account (e.g. CharlieM312)
@@ -1218,6 +1305,17 @@ export default {
           displayName = displayName || ghIdentity.display_name;
         }
 
+        if (provider === "microsoft" && body.code) {
+          const msIdentity = await exchangeMicrosoftCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || msIdentity.provider_user_id;
+          email = email || msIdentity.email;
+          displayName = displayName || msIdentity.display_name;
+        }
+
         if (body.id_token) {
           const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
           providerUserId = providerUserId || tokenIdentity.provider_user_id;
@@ -1225,11 +1323,27 @@ export default {
           displayName = displayName || tokenIdentity.display_name;
         }
 
+        if (!email && providerUserId.includes("@")) {
+          email = providerUserId;
+        }
+        if (!providerUserId && email) {
+          providerUserId = email;
+        }
+
         if (!providerUserId) {
           return jsonResponse(
-            { error: "Missing required field: code, id_token, or provider_user_id" },
+            { error: "Missing required field: code, id_token, email, or provider_user_id" },
             { status: 400 }
           );
+        }
+
+        if (email) {
+          await db
+            .prepare(
+              "UPDATE users SET email = COALESCE(email, ?) WHERE username = ?"
+            )
+            .bind(email, user.username)
+            .run();
         }
 
         await db

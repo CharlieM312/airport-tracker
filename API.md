@@ -22,12 +22,26 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 | :--- | :--- | :--- |
 | `id` | `INTEGER PRIMARY KEY` | Auto-incrementing user ID |
 | `username` | `TEXT NOT NULL UNIQUE` | Unique username (e.g., `CharlieM312`) |
-| `password` | `TEXT NOT NULL` | User password |
-| `session_token` | `TEXT` | Active session token issued by `POST /api/login` or `POST /api/webauthn/login-verify` |
+| `password` | `TEXT NOT NULL` | User password (`''` for OAuth-only accounts) |
+| `email` | `TEXT` | Optional user email address |
+| `role` | `TEXT NOT NULL DEFAULT 'user'` | `'admin'` or `'user'` (`CharlieM312` / `id = 1` is `'admin'`) |
+| `status` | `TEXT NOT NULL DEFAULT 'approved'` | `'pending'`, `'approved'`, or `'rejected'` (new OAuth / registered accounts start as `'pending'`) |
+| `session_token` | `TEXT` | Active session token issued by `POST /api/login`, `POST /api/oauth/login`, or `POST /api/webauthn/login-verify` |
 | `totp_secret` | `TEXT` | Active Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
 | `totp_pending_secret` | `TEXT` | Unverified Base32 TOTP secret awaiting 6-digit code confirmation |
 | `webauthn_challenge` | `TEXT` | Ephemeral WebAuthn challenge for registration or sign-in |
 | `created_at` | `DATETIME` | Timestamp when the user was created |
+
+### `user_oauth_accounts`
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `INTEGER PRIMARY KEY` | Auto-incrementing OAuth link ID |
+| `username` | `TEXT NOT NULL` | Foreign key referencing `users(username) ON DELETE CASCADE ON UPDATE CASCADE` |
+| `provider` | `TEXT NOT NULL` | `'github'`, `'google'`, `'microsoft'`, or `'apple'` |
+| `provider_user_id` | `TEXT NOT NULL` | Unique subject/user ID (`sub`) from the OAuth provider |
+| `email` | `TEXT` | Verified email address from the OAuth provider |
+| `display_name` | `TEXT` | Display name or handle from the OAuth provider |
+| `created_at` | `DATETIME` | Timestamp when the OAuth identity was linked |
 
 ### `user_passkeys`
 | Column | Type | Description |
@@ -130,6 +144,54 @@ Enrolls a YubiKey / FIDO2 security key or passkey for the signed-in user (multip
 Authenticates a user with their enrolled YubiKey / security key:
 - `POST /api/webauthn/login-options` accepts `{ username, password? }` and returns `{ challenge, rpId, allowCredentials }`.
 - `POST /api/webauthn/login-verify` verifies the ECDSA P-256 signature over `authenticatorData || SHA-256(clientDataJSON)` using Web Crypto and returns `{ success: true, token, username }`.
+
+### 8. `GET /api/oauth/providers`, `POST /api/oauth/options`, & `POST /api/oauth/login` *(Public)*
+Supports signing in with **GitHub, Google, Microsoft (Entra / Personal), and Apple** with automatic **Admin Approval** gating for new accounts:
+1. **`GET /api/oauth/providers` (or `POST /api/oauth/options`)**: Issues a one-time CSRF `state` token in `oauth_states` and returns configured provider Client IDs (`GITHUB_CLIENT_ID`, `GOOGLE_CLIENT_ID`, `MICROSOFT_CLIENT_ID`, `APPLE_CLIENT_ID`).
+2. **`POST /api/oauth/login`**:
+   - Accepts `{ provider: "github" | "google" | "microsoft" | "apple", state?, id_token?, provider_user_id?, email?, display_name?, username?, totp_code? }`.
+   - **If already linked to an `'approved'` user**: Issues a `session_token` and returns `{ success: true, token, username, provider, role, is_admin, status: "approved" }`.
+   - **If new user (or `'pending'` user)**: Creates the user with `status = 'pending'` in `users` and links their OAuth identity in `user_oauth_accounts`, returning `202 Accepted` (or `403` on subsequent attempts while still pending):
+     ```json
+     {
+       "success": false,
+       "pending_approval": true,
+       "status": "pending",
+       "username": "new_user",
+       "provider": "github",
+       "message": "Your OAuth account has been registered and is awaiting admin approval before you can sign in."
+     }
+     ```
+
+### 9. `POST /api/oauth/link` & `DELETE /api/oauth/link` *(Protected)*
+Links or unlinks a GitHub, Google, Microsoft, or Apple account to the currently signed-in user:
+- `POST /api/oauth/link`: Accepts `{ provider, provider_user_id?, id_token?, email?, display_name? }` and returns `{ success: true, oauth_accounts }`.
+- `DELETE /api/oauth/link?provider=github` (or `?id=1`): Removes the linked OAuth account from the signed-in user.
+
+### 10. `POST /api/register` *(Public)*
+Submits a username/password account request (`{ username, password, email? }`) which creates a row in `users` with `status = 'pending'` awaiting admin approval.
+
+### 11. `PATCH /api/user/username` (or `PATCH /api/user`) *(Protected)*
+Renames the currently signed-in user's username across `users`, `airport_visits`, `user_passkeys`, and `user_oauth_accounts` in a single atomic D1 `db.batch()` transaction and purges the edge cache for both old and new usernames:
+```json
+{
+  "new_username": "CharlieM"
+}
+```
+**Response (`200 OK`):**
+```json
+{
+  "success": true,
+  "old_username": "CharlieM312",
+  "username": "CharlieM"
+}
+```
+
+### 12. `GET /api/admin/users`, `PATCH /api/admin/users/:username`, & `DELETE /api/admin/users/:username` *(Admin Only)*
+Admin endpoints for approving, rejecting, renaming, or deleting user accounts:
+- **`GET /api/admin/users`** (optional `?status=pending`): Returns `{ pending_count, total_count, users: [...] }` with each user's `status` (`'pending' | 'approved' | 'rejected'`), `role` (`'admin' | 'user'`), and linked `oauth_accounts`.
+- **`PATCH /api/admin/users/:username`** (or `PATCH /api/admin/users` with `{ username, status?: "approved" | "rejected" | "pending", role?: "admin" | "user", new_username?: "..." }`): Approves or rejects a user account, updates their role, and/or renames their username across all tables.
+- **`DELETE /api/admin/users/:username`**: Permanently deletes a pending/rejected user and cascades deletion to their `user_oauth_accounts` and `user_passkeys`.
 
 ---
 

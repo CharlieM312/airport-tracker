@@ -1,10 +1,20 @@
 /**
  * Airport Tracker Worker API
  *
- * Authentication & 2FA / WebAuthn Endpoints:
- * - POST   /api/login                     (Validates username, password, and optional 6-digit TOTP code)
+ * Authentication, 2FA, WebAuthn, OAuth & Admin Approval Endpoints:
+ * - POST   /api/login                     (Validates username, password, account approval status, and optional 6-digit TOTP code)
+ * - POST   /api/register                  (Creates a 'pending' account request awaiting admin approval)
  * - POST   /api/logout                    (Clears the active session_token in `users`)
- * - GET    /api/2fa/status                (Protected: returns { totp_enabled, webauthn_enabled })
+ * - PATCH  /api/user/username             (Protected: renames the signed-in user across users, visits, passkeys, and OAuth links)
+ * - GET    /api/oauth/providers           (Public: lists supported OAuth providers [github, google, microsoft, apple] & client IDs)
+ * - POST   /api/oauth/options             (Public: generates CSRF state nonce & returns provider config)
+ * - POST   /api/oauth/login               (Public: signs in an approved OAuth user or creates a 'pending' account for admin approval)
+ * - POST   /api/oauth/link                (Protected: links a GitHub/Google/Microsoft/Apple identity to the signed-in user)
+ * - DELETE /api/oauth/link                (Protected: unlinks an OAuth provider from the signed-in user)
+ * - GET    /api/admin/users               (Admin: lists users & pending approval requests)
+ * - PATCH  /api/admin/users               (Admin: approves/rejects a user, updates their role, or renames their username)
+ * - DELETE /api/admin/users               (Admin: deletes a pending/rejected user account)
+ * - GET    /api/2fa/status                (Protected: returns { totp_enabled, webauthn_enabled, passkeys, oauth_accounts, role, status })
  * - POST   /api/2fa/totp/setup            (Protected: generates pending Base32 TOTP secret & otpauth:// URI)
  * - POST   /api/2fa/totp/verify           (Protected: verifies a 6-digit code and activates totp_secret)
  * - DELETE /api/2fa/totp                  (Protected: disables Authenticator TOTP 2FA)
@@ -13,7 +23,7 @@
  * - POST   /api/webauthn/register-options (Protected: generates challenge to enroll a YubiKey / Passkey)
  * - POST   /api/webauthn/register-verify  (Protected: saves YubiKey credential_id & SPKI public_key)
  * - POST   /api/webauthn/login-options    (Public: generates challenge & allowCredentials for YubiKey sign-in)
- * - POST   /api/webauthn/login-verify     (Public: verifies YubiKey ECDSA P-256 signature & issues session token)
+ * - POST   /api/webauthn/login-verify     (Public: verifies YubiKey ECDSA/RSA signature & issues session token)
  *
  * Public Read Endpoints:
  * - GET /api/visits          (?username=&limit=&before=)
@@ -212,6 +222,199 @@ async function getUserPasskeys(db, username) {
   return results || [];
 }
 
+const SUPPORTED_OAUTH_PROVIDERS = ["github", "google", "microsoft", "apple"];
+
+/**
+ * Ensure `user_oauth_accounts` and `oauth_states` tables exist.
+ */
+async function ensureOAuthTables(db) {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS user_oauth_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+        provider TEXT NOT NULL,
+        provider_user_id TEXT NOT NULL,
+        email TEXT,
+        display_name TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(provider, provider_user_id)
+      )`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS oauth_states (
+        state TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        redirect_uri TEXT,
+        link_username TEXT,
+        created_at INTEGER NOT NULL
+      )`
+    )
+    .run();
+}
+
+/**
+ * Return all linked OAuth accounts for a username.
+ */
+async function getUserOAuthAccounts(db, username) {
+  await ensureOAuthTables(db);
+  const { results } = await db
+    .prepare(
+      "SELECT id, provider, provider_user_id, email, display_name, created_at FROM user_oauth_accounts WHERE username = ? ORDER BY id ASC"
+    )
+    .bind(username)
+    .all();
+  return results || [];
+}
+
+/**
+ * Determine whether a user row has administrator privileges.
+ */
+function isUserAdmin(user) {
+  if (!user) return false;
+  if (user.isApiSecret) return true;
+  if (user.role === "admin") return true;
+  if (user.username === "CharlieM312" || Number(user.id) === 1) return true;
+  return false;
+}
+
+/**
+ * Decode and validate an OpenID Connect JWT `id_token` (Google, Microsoft, Apple).
+ */
+function decodeAndValidateIdToken(idToken, provider, env) {
+  const parts = String(idToken || "").split(".");
+  if (parts.length < 2) {
+    throw new Error("Invalid OIDC id_token format");
+  }
+  const payloadBytes = base64UrlToBytes(parts[1]);
+  const claims = JSON.parse(new TextDecoder().decode(payloadBytes));
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (claims.exp && Number(claims.exp) < nowSeconds - 60) {
+    throw new Error("OAuth id_token has expired");
+  }
+
+  const iss = String(claims.iss || "").toLowerCase();
+  if (provider === "google" && iss && !iss.includes("accounts.google.com")) {
+    throw new Error("Invalid Google id_token issuer");
+  }
+  if (
+    provider === "microsoft" &&
+    iss &&
+    !iss.includes("microsoftonline.com") &&
+    !iss.includes("sts.windows.net") &&
+    !iss.includes("live.com")
+  ) {
+    throw new Error("Invalid Microsoft id_token issuer");
+  }
+  if (provider === "apple" && iss && !iss.includes("appleid.apple.com")) {
+    throw new Error("Invalid Apple id_token issuer");
+  }
+
+  const expectedClientId =
+    provider === "google"
+      ? env.GOOGLE_CLIENT_ID
+      : provider === "microsoft"
+      ? env.MICROSOFT_CLIENT_ID
+      : provider === "apple"
+      ? env.APPLE_CLIENT_ID
+      : provider === "github"
+      ? env.GITHUB_CLIENT_ID
+      : null;
+
+  if (expectedClientId && claims.aud && claims.aud !== expectedClientId) {
+    const audList = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    if (!audList.includes(expectedClientId)) {
+      throw new Error(`OAuth id_token audience does not match configured ${provider} client ID`);
+    }
+  }
+
+  return {
+    provider_user_id: String(claims.sub || claims.oid || claims.id || ""),
+    email: claims.email || claims.preferred_username || null,
+    display_name: claims.name || claims.preferred_username || claims.email || null,
+  };
+}
+
+/**
+ * Generate a unique username in `users` from a desired name / email / OAuth login.
+ */
+async function resolveUniqueUsername(db, rawBaseName) {
+  const cleaned = String(rawBaseName || "user")
+    .split("@")[0]
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 24) || "user";
+
+  let candidate = cleaned;
+  let suffix = 2;
+  while (true) {
+    const existing = await db
+      .prepare("SELECT username FROM users WHERE LOWER(username) = LOWER(?)")
+      .bind(candidate)
+      .first();
+    if (!existing) return candidate;
+    candidate = `${cleaned}_${suffix}`;
+    suffix++;
+  }
+}
+
+/**
+ * Validate and rename a username across `users`, `airport_visits`, `user_passkeys`, and `user_oauth_accounts`.
+ */
+async function renameUsernameInDb(db, oldUsername, rawNewUsername) {
+  const newUsername = String(rawNewUsername || "").trim();
+  if (!newUsername) {
+    return { error: "New username is required", status: 400 };
+  }
+  if (!/^[a-zA-Z0-9_.-]{2,32}$/.test(newUsername)) {
+    return {
+      error:
+        "Username must be 2–32 characters and contain only letters, numbers, underscores, hyphens, or dots",
+      status: 400,
+    };
+  }
+
+  if (newUsername === oldUsername) {
+    return { username: newUsername, changed: false };
+  }
+
+  // Check if another user already has this username (case-insensitive, allowing casing changes on own username)
+  const conflict = await db
+    .prepare(
+      "SELECT username FROM users WHERE LOWER(username) = LOWER(?) AND LOWER(username) != LOWER(?)"
+    )
+    .bind(newUsername, oldUsername)
+    .first();
+
+  if (conflict) {
+    return { error: `Username '${newUsername}' is already taken`, status: 409 };
+  }
+
+  await getUserPasskeys(db, oldUsername);
+  await ensureOAuthTables(db);
+
+  await db.batch([
+    db.prepare("PRAGMA defer_foreign_keys = ON"),
+    db
+      .prepare("UPDATE users SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+    db
+      .prepare("UPDATE airport_visits SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+    db
+      .prepare("UPDATE user_passkeys SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+    db
+      .prepare("UPDATE user_oauth_accounts SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+  ]);
+
+  return { username: newUsername, changed: true };
+}
+
 /**
  * Calculate great-circle distance between two coordinates using the Haversine formula.
  */
@@ -262,11 +465,31 @@ async function authenticateRequest(request, env, db) {
   // 1. Check session_token in D1 `users` table
   try {
     const user = await db
-      .prepare("SELECT id, username FROM users WHERE session_token = ?")
+      .prepare("SELECT * FROM users WHERE session_token = ?")
       .bind(token)
       .first();
 
     if (user) {
+      const accountStatus = user.status || "approved";
+      if (accountStatus !== "approved") {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            {
+              error:
+                accountStatus === "pending"
+                  ? "Your account is awaiting admin approval"
+                  : "Your account is not approved",
+              status: accountStatus,
+              pending_approval: accountStatus === "pending",
+            },
+            { status: 403 }
+          ),
+        };
+      }
+      user.isAdmin = isUserAdmin(user);
+      user.role = user.isAdmin ? "admin" : user.role || "user";
+      user.status = accountStatus;
       return { user, errorResponse: null };
     }
   } catch {
@@ -275,7 +498,10 @@ async function authenticateRequest(request, env, db) {
 
   // 2. Fallback: allow static env.API_SECRET for CLI / administrative tasks if configured
   if (env.API_SECRET && token === env.API_SECRET) {
-    return { user: { username: null, isApiSecret: true }, errorResponse: null };
+    return {
+      user: { username: null, isApiSecret: true, isAdmin: true, role: "admin" },
+      errorResponse: null,
+    };
   }
 
   return {
@@ -393,6 +619,29 @@ export default {
           );
         }
 
+        // Enforce admin approval status before allowing login
+        const accountStatus = user.status || "approved";
+        if (accountStatus === "pending") {
+          return jsonResponse(
+            {
+              error: "Your account is awaiting admin approval before you can sign in.",
+              status: "pending",
+              pending_approval: true,
+              username: user.username,
+            },
+            { status: 403 }
+          );
+        }
+        if (accountStatus !== "approved") {
+          return jsonResponse(
+            {
+              error: "Your account request was not approved.",
+              status: accountStatus,
+            },
+            { status: 403 }
+          );
+        }
+
         // If user has enrolled Microsoft/Yubico Authenticator TOTP, verify the 6-digit code
         if (user.totp_secret) {
           if (!totp_code) {
@@ -416,10 +665,688 @@ export default {
           .bind(sessionToken, user.username)
           .run();
 
+        const adminFlag = isUserAdmin(user);
         return jsonResponse({
           success: true,
           token: sessionToken,
           username: user.username,
+          role: adminFlag ? "admin" : user.role || "user",
+          is_admin: adminFlag,
+          status: accountStatus,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/register - Request a new account (Requires Admin Approval)
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/register") {
+      try {
+        const { username, password, email } = await request.json();
+        const cleanUsername = String(username || "").trim();
+
+        if (!cleanUsername || !password) {
+          return jsonResponse(
+            { error: "Username and password are required" },
+            { status: 400 }
+          );
+        }
+
+        const existing = await db
+          .prepare("SELECT username, status FROM users WHERE LOWER(username) = LOWER(?)")
+          .bind(cleanUsername)
+          .first();
+
+        if (existing) {
+          return jsonResponse(
+            { error: "That username is already registered or awaiting approval" },
+            { status: 409 }
+          );
+        }
+
+        try {
+          await db
+            .prepare(
+              "INSERT INTO users (username, password, email, role, status) VALUES (?, ?, ?, 'user', 'pending')"
+            )
+            .bind(cleanUsername, password, email || null)
+            .run();
+        } catch {
+          return jsonResponse(
+            {
+              error:
+                "Database migration 0006_oauth_and_admin_approval.sql is required before registering pending users.",
+            },
+            { status: 500 }
+          );
+        }
+
+        return jsonResponse(
+          {
+            success: true,
+            pending_approval: true,
+            status: "pending",
+            username: cleanUsername,
+            message: "Account request submitted. An administrator must approve your account before you can sign in.",
+          },
+          { status: 202 }
+        );
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // GET /api/oauth/providers & POST /api/oauth/options - OAuth state & config
+    // =========================================================================
+    if (
+      (request.method === "GET" && url.pathname === "/api/oauth/providers") ||
+      ((request.method === "GET" || request.method === "POST") &&
+        url.pathname === "/api/oauth/options")
+    ) {
+      try {
+        await ensureOAuthTables(db);
+        let requestedProvider = url.searchParams.get("provider");
+        let redirectUri = url.searchParams.get("redirect_uri");
+
+        if (request.method === "POST") {
+          try {
+            const body = await request.json();
+            requestedProvider = body.provider || requestedProvider;
+            redirectUri = body.redirect_uri || redirectUri;
+          } catch {
+            // Optional JSON body
+          }
+        }
+
+        const provider = requestedProvider
+          ? String(requestedProvider).toLowerCase().trim()
+          : "all";
+
+        if (provider !== "all" && !SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+          return jsonResponse(
+            {
+              error: `Unsupported OAuth provider '${provider}'. Supported: ${SUPPORTED_OAUTH_PROVIDERS.join(", ")}`,
+            },
+            { status: 400 }
+          );
+        }
+
+        const nowMs = Date.now();
+        // Clean up expired CSRF states older than 15 minutes
+        await db
+          .prepare("DELETE FROM oauth_states WHERE created_at < ?")
+          .bind(nowMs - 15 * 60 * 1000)
+          .run();
+
+        const state = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
+        await db
+          .prepare(
+            "INSERT INTO oauth_states (state, provider, redirect_uri, created_at) VALUES (?, ?, ?, ?)"
+          )
+          .bind(state, provider, redirectUri || null, nowMs)
+          .run();
+
+        return jsonResponse({
+          state,
+          providers: {
+            github: {
+              enabled: true,
+              client_id: env.GITHUB_CLIENT_ID || null,
+            },
+            google: {
+              enabled: true,
+              client_id: env.GOOGLE_CLIENT_ID || null,
+            },
+            microsoft: {
+              enabled: true,
+              client_id: env.MICROSOFT_CLIENT_ID || null,
+            },
+            apple: {
+              enabled: true,
+              client_id: env.APPLE_CLIENT_ID || null,
+            },
+          },
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/oauth/login - Sign in via OAuth or create a 'pending' account
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/oauth/login") {
+      try {
+        await ensureOAuthTables(db);
+        const body = await request.json();
+        const provider = String(body.provider || "").toLowerCase().trim();
+
+        if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+          return jsonResponse(
+            {
+              error: `Invalid or missing OAuth provider. Supported: ${SUPPORTED_OAUTH_PROVIDERS.join(", ")}`,
+            },
+            { status: 400 }
+          );
+        }
+
+        // Verify one-time CSRF state nonce if supplied
+        if (body.state) {
+          const stateRow = await db
+            .prepare("SELECT * FROM oauth_states WHERE state = ?")
+            .bind(body.state)
+            .first();
+
+          if (!stateRow) {
+            return jsonResponse(
+              { error: "Invalid or expired OAuth state parameter" },
+              { status: 401 }
+            );
+          }
+
+          await db
+            .prepare("DELETE FROM oauth_states WHERE state = ?")
+            .bind(body.state)
+            .run();
+        }
+
+        let providerUserId = String(body.provider_user_id || body.sub || "").trim();
+        let email = body.email ? String(body.email).trim() : null;
+        let displayName = body.display_name || body.username || body.name || null;
+
+        // If an OpenID Connect id_token JWT was provided (Google, Microsoft, Apple), decode & validate its claims
+        if (body.id_token) {
+          const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
+          providerUserId = providerUserId || tokenIdentity.provider_user_id;
+          email = email || tokenIdentity.email;
+          displayName = displayName || tokenIdentity.display_name;
+        }
+
+        if (!providerUserId) {
+          return jsonResponse(
+            { error: "Missing OAuth identity (provider_user_id or id_token)" },
+            { status: 400 }
+          );
+        }
+
+        // 1. Check if this OAuth account is already linked to a user
+        const existingOAuth = await db
+          .prepare(
+            "SELECT * FROM user_oauth_accounts WHERE provider = ? AND provider_user_id = ?"
+          )
+          .bind(provider, providerUserId)
+          .first();
+
+        if (existingOAuth) {
+          const user = await db
+            .prepare("SELECT * FROM users WHERE username = ?")
+            .bind(existingOAuth.username)
+            .first();
+
+          if (!user) {
+            return jsonResponse({ error: "Linked user account no longer exists" }, { status: 404 });
+          }
+
+          const accountStatus = user.status || "approved";
+          if (accountStatus === "pending") {
+            return jsonResponse(
+              {
+                success: false,
+                pending_approval: true,
+                status: "pending",
+                username: user.username,
+                provider,
+                error: "Your account is awaiting admin approval before you can sign in.",
+              },
+              { status: 403 }
+            );
+          }
+          if (accountStatus !== "approved") {
+            return jsonResponse(
+              {
+                success: false,
+                status: accountStatus,
+                error: "Your account request was not approved by an administrator.",
+              },
+              { status: 403 }
+            );
+          }
+
+          // Optional: if the user also has Authenticator TOTP enabled on their account, verify it if required
+          if (user.totp_secret && body.totp_code) {
+            const isValidTotp = await verifyTotp(user.totp_secret, body.totp_code);
+            if (!isValidTotp) {
+              return jsonResponse(
+                { error: "Invalid 6-digit Authenticator code" },
+                { status: 401 }
+              );
+            }
+          }
+
+          const sessionToken = crypto.randomUUID();
+          await db
+            .prepare("UPDATE users SET session_token = ? WHERE username = ?")
+            .bind(sessionToken, user.username)
+            .run();
+
+          const adminFlag = isUserAdmin(user);
+          return jsonResponse({
+            success: true,
+            token: sessionToken,
+            username: user.username,
+            provider,
+            role: adminFlag ? "admin" : user.role || "user",
+            is_admin: adminFlag,
+            status: accountStatus,
+          });
+        }
+
+        // 2. New OAuth user: create a 'pending' user in `users` awaiting admin approval!
+        const candidateUsername = await resolveUniqueUsername(
+          db,
+          body.username || displayName || email || `${provider}_user`
+        );
+
+        await db
+          .prepare(
+            "INSERT INTO users (username, password, email, role, status) VALUES (?, '', ?, 'user', 'pending')"
+          )
+          .bind(candidateUsername, email)
+          .run();
+
+        await db
+          .prepare(
+            `INSERT INTO user_oauth_accounts (username, provider, provider_user_id, email, display_name)
+             VALUES (?, ?, ?, ?, ?)`
+          )
+          .bind(candidateUsername, provider, providerUserId, email, displayName)
+          .run();
+
+        return jsonResponse(
+          {
+            success: false,
+            pending_approval: true,
+            status: "pending",
+            username: candidateUsername,
+            provider,
+            message:
+              "Your OAuth account has been registered and is awaiting admin approval before you can sign in.",
+          },
+          { status: 202 }
+        );
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // POST /api/oauth/link & DELETE /api/oauth/link - Link/Unlink OAuth (Protected)
+    // =========================================================================
+    if (
+      (request.method === "POST" || request.method === "DELETE") &&
+      url.pathname === "/api/oauth/link"
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to link OAuth providers" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        await ensureOAuthTables(db);
+
+        if (request.method === "DELETE") {
+          let body = {};
+          try {
+            body = await request.json();
+          } catch {
+            // Optional JSON body
+          }
+          const provider = String(
+            url.searchParams.get("provider") || body.provider || ""
+          )
+            .toLowerCase()
+            .trim();
+          const accountId = url.searchParams.get("id") || body.id || null;
+
+          if (accountId) {
+            await db
+              .prepare("DELETE FROM user_oauth_accounts WHERE username = ? AND id = ?")
+              .bind(user.username, accountId)
+              .run();
+          } else if (provider) {
+            await db
+              .prepare("DELETE FROM user_oauth_accounts WHERE username = ? AND provider = ?")
+              .bind(user.username, provider)
+              .run();
+          } else {
+            return jsonResponse(
+              { error: "Specify provider or id to unlink" },
+              { status: 400 }
+            );
+          }
+
+          const updatedAccounts = await getUserOAuthAccounts(db, user.username);
+          return jsonResponse({
+            success: true,
+            oauth_accounts: updatedAccounts,
+          });
+        }
+
+        // POST /api/oauth/link - Link an OAuth provider to the signed-in user
+        const body = await request.json();
+        const provider = String(body.provider || "").toLowerCase().trim();
+        if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+          return jsonResponse(
+            {
+              error: `Unsupported OAuth provider. Supported: ${SUPPORTED_OAUTH_PROVIDERS.join(", ")}`,
+            },
+            { status: 400 }
+          );
+        }
+
+        let providerUserId = String(body.provider_user_id || body.sub || "").trim();
+        let email = body.email ? String(body.email).trim() : null;
+        let displayName = body.display_name || body.name || null;
+
+        if (body.id_token) {
+          const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
+          providerUserId = providerUserId || tokenIdentity.provider_user_id;
+          email = email || tokenIdentity.email;
+          displayName = displayName || tokenIdentity.display_name;
+        }
+
+        if (!providerUserId) {
+          return jsonResponse(
+            { error: "Missing required field: provider_user_id (or id_token)" },
+            { status: 400 }
+          );
+        }
+
+        await db
+          .prepare(
+            `INSERT INTO user_oauth_accounts (username, provider, provider_user_id, email, display_name)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(provider, provider_user_id) DO UPDATE SET
+               username = excluded.username,
+               email = COALESCE(excluded.email, user_oauth_accounts.email),
+               display_name = COALESCE(excluded.display_name, user_oauth_accounts.display_name)`
+          )
+          .bind(user.username, provider, providerUserId, email, displayName)
+          .run();
+
+        const updatedAccounts = await getUserOAuthAccounts(db, user.username);
+        return jsonResponse({
+          success: true,
+          oauth_accounts: updatedAccounts,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // GET, PATCH, DELETE /api/admin/users - Admin User Approval & Management
+    // =========================================================================
+    if (
+      url.pathname === "/api/admin/users" ||
+      url.pathname.startsWith("/api/admin/users/")
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!isUserAdmin(user)) {
+        return jsonResponse(
+          { error: "Forbidden: Administrator privileges required" },
+          { status: 403 }
+        );
+      }
+
+      try {
+        await ensureOAuthTables(db);
+
+        // 1. GET /api/admin/users - List all users & pending requests
+        if (request.method === "GET") {
+          const statusFilter = url.searchParams.get("status");
+          let query =
+            "SELECT id, username, email, role, status, totp_secret, created_at FROM users";
+          const params = [];
+          if (statusFilter) {
+            query += " WHERE status = ?";
+            params.push(statusFilter);
+          }
+          query +=
+            " ORDER BY CASE WHEN status = 'pending' THEN 0 WHEN status = 'approved' THEN 1 ELSE 2 END, created_at DESC";
+
+          const { results: userRows } = await db
+            .prepare(query)
+            .bind(...params)
+            .all();
+
+          const { results: oauthRows } = await db
+            .prepare(
+              "SELECT id, username, provider, provider_user_id, email, display_name, created_at FROM user_oauth_accounts"
+            )
+            .all();
+
+          const oauthByUser = new Map();
+          for (const row of oauthRows || []) {
+            const list = oauthByUser.get(row.username) || [];
+            list.push({
+              id: row.id,
+              provider: row.provider,
+              provider_user_id: row.provider_user_id,
+              email: row.email,
+              display_name: row.display_name,
+              created_at: row.created_at,
+            });
+            oauthByUser.set(row.username, list);
+          }
+
+          const formattedUsers = (userRows || []).map((u) => ({
+            id: u.id,
+            username: u.username,
+            email: u.email || null,
+            role: isUserAdmin(u) ? "admin" : u.role || "user",
+            status: u.status || "approved",
+            totp_enabled: Boolean(u.totp_secret),
+            oauth_accounts: oauthByUser.get(u.username) || [],
+            created_at: u.created_at,
+          }));
+
+          const pendingCount = formattedUsers.filter((u) => u.status === "pending").length;
+
+          return jsonResponse({
+            pending_count: pendingCount,
+            total_count: formattedUsers.length,
+            users: formattedUsers,
+          });
+        }
+
+        // 2. PATCH /api/admin/users (or /api/admin/users/:username) - Approve / Reject / Update Role
+        if (request.method === "PATCH" || request.method === "PUT") {
+          const pathUsername = url.pathname.startsWith("/api/admin/users/")
+            ? decodeURIComponent(url.pathname.slice("/api/admin/users/".length))
+            : null;
+          const body = await request.json();
+          const targetUsername = pathUsername || body.username;
+
+          if (!targetUsername) {
+            return jsonResponse(
+              { error: "Missing required field: username" },
+              { status: 400 }
+            );
+          }
+
+          const existingUser = await db
+            .prepare("SELECT * FROM users WHERE username = ?")
+            .bind(targetUsername)
+            .first();
+
+          if (!existingUser) {
+            return jsonResponse({ error: "User not found" }, { status: 404 });
+          }
+
+          const nextStatus = body.status || existingUser.status || "approved";
+          if (!["pending", "approved", "rejected"].includes(nextStatus)) {
+            return jsonResponse(
+              { error: "Invalid status. Must be 'approved', 'pending', or 'rejected'" },
+              { status: 400 }
+            );
+          }
+
+          const nextRole = body.role || existingUser.role || "user";
+          if (!["admin", "user"].includes(nextRole)) {
+            return jsonResponse(
+              { error: "Invalid role. Must be 'admin' or 'user'" },
+              { status: 400 }
+            );
+          }
+
+          // Clear session_token if account is rejected or moved back to pending
+          const nextSessionToken =
+            nextStatus === "approved" ? existingUser.session_token : null;
+
+          await db
+            .prepare(
+              "UPDATE users SET status = ?, role = ?, session_token = ? WHERE username = ?"
+            )
+            .bind(nextStatus, nextRole, nextSessionToken, targetUsername)
+            .run();
+
+          let finalUsername = targetUsername;
+          if (body.new_username && String(body.new_username).trim() !== targetUsername) {
+            const renameResult = await renameUsernameInDb(
+              db,
+              targetUsername,
+              body.new_username
+            );
+            if (renameResult.error) {
+              return jsonResponse(
+                { error: renameResult.error },
+                { status: renameResult.status || 400 }
+              );
+            }
+            finalUsername = renameResult.username;
+            ctx.waitUntil(
+              invalidateVisitCaches(cache, url.origin, [targetUsername, finalUsername])
+            );
+          }
+
+          return jsonResponse({
+            success: true,
+            old_username: targetUsername,
+            username: finalUsername,
+            status: nextStatus,
+            role: nextRole,
+          });
+        }
+
+        // 3. DELETE /api/admin/users (or /api/admin/users/:username) - Remove a user
+        if (request.method === "DELETE") {
+          const pathUsername = url.pathname.startsWith("/api/admin/users/")
+            ? decodeURIComponent(url.pathname.slice("/api/admin/users/".length))
+            : null;
+          let body = {};
+          try {
+            body = await request.json();
+          } catch {
+            // Optional JSON body
+          }
+          const targetUsername =
+            pathUsername || url.searchParams.get("username") || body.username;
+
+          if (!targetUsername) {
+            return jsonResponse(
+              { error: "Missing required field: username" },
+              { status: 400 }
+            );
+          }
+
+          if (user.username && targetUsername.toLowerCase() === user.username.toLowerCase()) {
+            return jsonResponse(
+              { error: "You cannot delete your own active admin account" },
+              { status: 400 }
+            );
+          }
+
+          await db
+            .prepare("DELETE FROM user_oauth_accounts WHERE username = ?")
+            .bind(targetUsername)
+            .run();
+          await db
+            .prepare("DELETE FROM user_passkeys WHERE username = ?")
+            .bind(targetUsername)
+            .run();
+          const info = await db
+            .prepare("DELETE FROM users WHERE username = ?")
+            .bind(targetUsername)
+            .run();
+
+          if (info.meta.changes === 0) {
+            return jsonResponse({ error: "User not found" }, { status: 404 });
+          }
+
+          return jsonResponse({
+            success: true,
+            deleted: targetUsername,
+          });
+        }
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // PATCH /api/user/username (or PATCH /api/user) - Edit current user's username (Protected)
+    // =========================================================================
+    if (
+      (request.method === "PATCH" || request.method === "PUT") &&
+      (url.pathname === "/api/user/username" || url.pathname === "/api/user")
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to edit your username" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const body = await request.json();
+        const requestedUsername = body.new_username || body.username;
+
+        const renameResult = await renameUsernameInDb(
+          db,
+          user.username,
+          requestedUsername
+        );
+        if (renameResult.error) {
+          return jsonResponse(
+            { error: renameResult.error },
+            { status: renameResult.status || 400 }
+          );
+        }
+
+        if (renameResult.changed) {
+          ctx.waitUntil(
+            invalidateVisitCaches(cache, url.origin, [
+              user.username,
+              renameResult.username,
+            ])
+          );
+        }
+
+        return jsonResponse({
+          success: true,
+          old_username: user.username,
+          username: renameResult.username,
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -459,14 +1386,19 @@ export default {
 
       try {
         const record = await db
-          .prepare("SELECT totp_secret FROM users WHERE username = ?")
+          .prepare("SELECT * FROM users WHERE username = ?")
           .bind(user.username)
           .first();
 
         const passkeys = await getUserPasskeys(db, user.username);
+        const oauthAccounts = await getUserOAuthAccounts(db, user.username);
+        const adminFlag = isUserAdmin(record || user);
 
         return jsonResponse({
           username: user.username,
+          role: adminFlag ? "admin" : (record && record.role) || "user",
+          is_admin: adminFlag,
+          status: (record && record.status) || "approved",
           totp_enabled: Boolean(record && record.totp_secret),
           webauthn_enabled: passkeys.length > 0,
           passkey_count: passkeys.length,
@@ -476,6 +1408,7 @@ export default {
             label: k.label || `Security Key #${idx + 1}`,
             created_at: k.created_at,
           })),
+          oauth_accounts: oauthAccounts,
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -1007,6 +1940,21 @@ export default {
           );
         }
 
+        const accountStatus = user.status || "approved";
+        if (accountStatus !== "approved") {
+          return jsonResponse(
+            {
+              error:
+                accountStatus === "pending"
+                  ? "Your account is awaiting admin approval before you can sign in."
+                  : "Your account request was not approved.",
+              status: accountStatus,
+              pending_approval: accountStatus === "pending",
+            },
+            { status: 403 }
+          );
+        }
+
         const sessionToken = crypto.randomUUID();
         await db
           .prepare(
@@ -1015,10 +1963,14 @@ export default {
           .bind(sessionToken, user.username)
           .run();
 
+        const adminFlag = isUserAdmin(user);
         return jsonResponse({
           success: true,
           token: sessionToken,
           username: user.username,
+          role: adminFlag ? "admin" : user.role || "user",
+          is_admin: adminFlag,
+          status: accountStatus,
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });

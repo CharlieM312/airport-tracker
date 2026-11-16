@@ -29,5 +29,6 @@ npx wrangler deploy
 - `migrations/0002_add_indexes.sql` — Indexes for date sorting (`idx_visits_date`) and user-filtered queries (`idx_visits_user_date`).
 - `migrations/0003_airports_and_flights.sql` — `airports` reference table with UK & international airport coordinates, foreign key constraints, and flight leg columns (`origin_iata`, `flight_number`, `distance_km`).
 - `migrations/0004_users_and_sessions.sql` — `users` table with `username`, `password`, and indexed `session_token` for database-backed authentication.
-- `migrations/0005_2fa_and_webauthn.sql` — Adds `totp_secret`, `webauthn_credential_id`, `webauthn_public_key`, and `webauthn_challenge` to `users` for Microsoft Authenticator (TOTP) and YubiKey (`WebAuthn`) 2FA.
+- `migrations/0005_2fa_and_webauthn.sql` — Adds `totp_secret`, `totp_pending_secret`, and `webauthn_challenge` to `users` and creates `user_passkeys` for Microsoft Authenticator (TOTP) and multiple YubiKeys/Passkeys (`WebAuthn`).
+- `migrations/0006_oauth_and_admin_approval.sql` — Adds `role`, `status` (`'pending' | 'approved' | 'rejected'`), and `email` to `users`, and creates `user_oauth_accounts` & `oauth_states` for GitHub, Google, Microsoft, and Apple OAuth with Admin Approval gating.
 - `wrangler.jsonc` — Cloudflare Worker & D1 binding configuration.

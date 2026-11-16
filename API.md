@@ -149,7 +149,8 @@ Authenticates a user with their enrolled YubiKey / security key:
 Supports signing in with **GitHub, Google, Microsoft (Entra / Personal), and Apple** with automatic **Admin Approval** gating for new accounts:
 1. **`GET /api/oauth/providers` (or `POST /api/oauth/options`)**: Issues a one-time CSRF `state` token in `oauth_states` and returns configured provider Client IDs (`GITHUB_CLIENT_ID`, `GOOGLE_CLIENT_ID`, `MICROSOFT_CLIENT_ID`, `APPLE_CLIENT_ID`).
 2. **`POST /api/oauth/login`**:
-   - Accepts `{ provider: "github" | "google" | "microsoft" | "apple", state?, id_token?, provider_user_id?, email?, display_name?, username?, totp_code? }`.
+   - Accepts `{ provider: "github" | "google" | "microsoft" | "apple", state?, code?, redirect_uri?, id_token?, provider_user_id?, email?, display_name?, username?, totp_code? }`.
+   - When `provider === "github"` and `code` is provided, the Worker exchanges `code` with `https://github.com/login/oauth/access_token` (using `env.GITHUB_CLIENT_ID` and `env.GITHUB_CLIENT_SECRET`) and fetches the profile from `https://api.github.com/user` (with fallback to `/user/emails`).
    - **If already linked to an `'approved'` user**: Issues a `session_token` and returns `{ success: true, token, username, provider, role, is_admin, status: "approved" }`.
    - **If new user (or `'pending'` user)**: Creates the user with `status = 'pending'` in `users` and links their OAuth identity in `user_oauth_accounts`, returning `202 Accepted` (or `403` on subsequent attempts while still pending):
      ```json
@@ -165,7 +166,7 @@ Supports signing in with **GitHub, Google, Microsoft (Entra / Personal), and App
 
 ### 9. `POST /api/oauth/link` & `DELETE /api/oauth/link` *(Protected)*
 Links or unlinks a GitHub, Google, Microsoft, or Apple account to the currently signed-in user:
-- `POST /api/oauth/link`: Accepts `{ provider, provider_user_id?, id_token?, email?, display_name? }` and returns `{ success: true, oauth_accounts }`.
+- `POST /api/oauth/link`: Accepts `{ provider, code?, redirect_uri?, state?, provider_user_id?, id_token?, email?, display_name? }` and returns `{ success: true, oauth_accounts }`.
 - `DELETE /api/oauth/link?provider=github` (or `?id=1`): Removes the linked OAuth account from the signed-in user.
 
 ### 10. `POST /api/register` *(Public)*

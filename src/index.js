@@ -340,6 +340,92 @@ function decodeAndValidateIdToken(idToken, provider, env) {
 }
 
 /**
+ * Exchange a GitHub OAuth authorization `code` for an access token and fetch the GitHub user profile.
+ */
+async function exchangeGitHubCode(code, redirectUri, env) {
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+    throw new Error(
+      "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be configured on the Worker"
+    );
+  }
+
+  const tokenPayload = {
+    client_id: env.GITHUB_CLIENT_ID,
+    client_secret: env.GITHUB_CLIENT_SECRET,
+    code: String(code).trim(),
+  };
+  if (redirectUri) {
+    tokenPayload.redirect_uri = redirectUri;
+  }
+
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": "Airport-Tracker-Worker",
+    },
+    body: JSON.stringify(tokenPayload),
+  });
+
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(
+      tokenData.error_description ||
+        tokenData.error ||
+        "Failed to exchange GitHub OAuth code for access token"
+    );
+  }
+
+  const userRes = await fetch("https://api.github.com/user", {
+    headers: {
+      Authorization: `Bearer ${tokenData.access_token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "Airport-Tracker-Worker",
+    },
+  });
+
+  const ghUser = await userRes.json();
+  if (!userRes.ok || !ghUser || !ghUser.id) {
+    throw new Error(ghUser?.message || "Failed to fetch GitHub user profile");
+  }
+
+  let primaryEmail = ghUser.email || null;
+  if (!primaryEmail) {
+    try {
+      const emailsRes = await fetch("https://api.github.com/user/emails", {
+        headers: {
+          Authorization: `Bearer ${tokenData.access_token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "Airport-Tracker-Worker",
+        },
+      });
+      if (emailsRes.ok) {
+        const emails = await emailsRes.json();
+        if (Array.isArray(emails)) {
+          const found =
+            emails.find((e) => e.primary && e.verified) ||
+            emails.find((e) => e.verified) ||
+            emails[0];
+          if (found && found.email) {
+            primaryEmail = found.email;
+          }
+        }
+      }
+    } catch {
+      // Optional email lookup fallback
+    }
+  }
+
+  return {
+    provider_user_id: String(ghUser.id),
+    email: primaryEmail,
+    display_name: ghUser.login || ghUser.name || null,
+    username: ghUser.login || null,
+  };
+}
+
+/**
  * Generate a unique username in `users` from a desired name / email / OAuth login.
  */
 async function resolveUniqueUsername(db, rawBaseName) {
@@ -857,6 +943,18 @@ export default {
         let email = body.email ? String(body.email).trim() : null;
         let displayName = body.display_name || body.username || body.name || null;
 
+        // If a GitHub OAuth authorization code was provided, exchange it for the GitHub user profile
+        if (provider === "github" && body.code) {
+          const ghIdentity = await exchangeGitHubCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || ghIdentity.provider_user_id;
+          email = email || ghIdentity.email;
+          displayName = displayName || ghIdentity.display_name;
+        }
+
         // If an OpenID Connect id_token JWT was provided (Google, Microsoft, Apple), decode & validate its claims
         if (body.id_token) {
           const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
@@ -867,7 +965,7 @@ export default {
 
         if (!providerUserId) {
           return jsonResponse(
-            { error: "Missing OAuth identity (provider_user_id or id_token)" },
+            { error: "Missing OAuth identity (code, id_token, or provider_user_id)" },
             { status: 400 }
           );
         }
@@ -1055,6 +1153,24 @@ export default {
         let email = body.email ? String(body.email).trim() : null;
         let displayName = body.display_name || body.name || null;
 
+        if (body.state) {
+          await db
+            .prepare("DELETE FROM oauth_states WHERE state = ?")
+            .bind(body.state)
+            .run();
+        }
+
+        if (provider === "github" && body.code) {
+          const ghIdentity = await exchangeGitHubCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || ghIdentity.provider_user_id;
+          email = email || ghIdentity.email;
+          displayName = displayName || ghIdentity.display_name;
+        }
+
         if (body.id_token) {
           const tokenIdentity = decodeAndValidateIdToken(body.id_token, provider, env);
           providerUserId = providerUserId || tokenIdentity.provider_user_id;
@@ -1064,7 +1180,7 @@ export default {
 
         if (!providerUserId) {
           return jsonResponse(
-            { error: "Missing required field: provider_user_id (or id_token)" },
+            { error: "Missing required field: code, id_token, or provider_user_id" },
             { status: 400 }
           );
         }

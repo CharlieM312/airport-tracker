@@ -16,6 +16,9 @@
 			"enabled": false
 		}
 	},
+	"vars": {
+		"GITHUB_CLIENT_ID": "Ov23li6QFlqXfQQIVmy9"
+	},
 	"d1_databases": [
 		{
 		"binding": "DB",

@@ -17,7 +17,8 @@
 		}
 	},
 	"vars": {
-		"GITHUB_CLIENT_ID": "Ov23li6QFlqXfQQIVmy9"
+		"GITHUB_CLIENT_ID": "Ov23li6QFlqXfQQIVmy9",
+		"MICROSOFT_CLIENT_ID": "d8009171-216d-45d7-8b91-de11a2d23f26"
 	},
 	"d1_databases": [
 		{

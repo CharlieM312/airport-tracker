@@ -508,6 +508,67 @@ async function exchangeMicrosoftCode(code, redirectUri, env) {
 }
 
 /**
+ * Exchange a Google OAuth 2.0 authorization `code` for an `id_token` / user profile.
+ */
+async function exchangeGoogleCode(code, redirectUri, env) {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+    throw new Error(
+      "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured on the Worker"
+    );
+  }
+
+  const form = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    client_secret: env.GOOGLE_CLIENT_SECRET,
+    code: String(code).trim(),
+    grant_type: "authorization_code",
+  });
+  if (redirectUri) {
+    form.set("redirect_uri", redirectUri);
+  }
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: form.toString(),
+  });
+
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || (!tokenData.id_token && !tokenData.access_token)) {
+    throw new Error(
+      tokenData.error_description ||
+        tokenData.error ||
+        "Failed to exchange Google OAuth code for token"
+    );
+  }
+
+  if (tokenData.id_token) {
+    return decodeAndValidateIdToken(tokenData.id_token, "google", env);
+  }
+
+  const userRes = await fetch(
+    "https://openidconnect.googleapis.com/v1/userinfo",
+    {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+      },
+    }
+  );
+  const gUser = await userRes.json();
+  if (!userRes.ok || !gUser || !gUser.sub) {
+    throw new Error("Failed to fetch Google user profile");
+  }
+
+  return {
+    provider_user_id: String(gUser.sub),
+    email: gUser.email || null,
+    display_name: gUser.name || gUser.email || null,
+  };
+}
+
+/**
  * Generate a unique username in `users` from a desired name / email / OAuth login.
  */
 async function resolveUniqueUsername(db, rawBaseName) {
@@ -990,18 +1051,9 @@ export default {
       try {
         await ensureOAuthTables(db);
         const body = await request.json();
-        const provider = String(body.provider || "").toLowerCase().trim();
+        let provider = String(body.provider || "").toLowerCase().trim();
 
-        if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
-          return jsonResponse(
-            {
-              error: `Invalid or missing OAuth provider. Supported: ${SUPPORTED_OAUTH_PROVIDERS.join(", ")}`,
-            },
-            { status: 400 }
-          );
-        }
-
-        // Verify one-time CSRF state nonce if supplied
+        // Verify one-time CSRF state nonce if supplied (and resolve provider from stateRow if recorded)
         if (body.state) {
           const stateRow = await db
             .prepare("SELECT * FROM oauth_states WHERE state = ?")
@@ -1015,10 +1067,27 @@ export default {
             );
           }
 
+          if (
+            stateRow.provider &&
+            stateRow.provider !== "all" &&
+            SUPPORTED_OAUTH_PROVIDERS.includes(stateRow.provider)
+          ) {
+            provider = stateRow.provider;
+          }
+
           await db
             .prepare("DELETE FROM oauth_states WHERE state = ?")
             .bind(body.state)
             .run();
+        }
+
+        if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+          return jsonResponse(
+            {
+              error: `Invalid or missing OAuth provider. Supported: ${SUPPORTED_OAUTH_PROVIDERS.join(", ")}`,
+            },
+            { status: 400 }
+          );
         }
 
         let providerUserId = String(body.provider_user_id || body.sub || "").trim();
@@ -1035,6 +1104,18 @@ export default {
           providerUserId = providerUserId || ghIdentity.provider_user_id;
           email = email || ghIdentity.email;
           displayName = displayName || ghIdentity.display_name;
+        }
+
+        // If a Google OAuth authorization code was provided, exchange it for the Google user profile
+        if (provider === "google" && body.code) {
+          const googleIdentity = await exchangeGoogleCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || googleIdentity.provider_user_id;
+          email = email || googleIdentity.email;
+          displayName = displayName || googleIdentity.display_name;
         }
 
         // If a Microsoft OAuth authorization code was provided, exchange it for the Microsoft user profile
@@ -1273,7 +1354,29 @@ export default {
 
         // POST /api/oauth/link - Link an OAuth provider to the signed-in user
         const body = await request.json();
-        const provider = String(body.provider || "").toLowerCase().trim();
+        let provider = String(body.provider || "").toLowerCase().trim();
+
+        if (body.state) {
+          const stateRow = await db
+            .prepare("SELECT * FROM oauth_states WHERE state = ?")
+            .bind(body.state)
+            .first();
+
+          if (
+            stateRow &&
+            stateRow.provider &&
+            stateRow.provider !== "all" &&
+            SUPPORTED_OAUTH_PROVIDERS.includes(stateRow.provider)
+          ) {
+            provider = stateRow.provider;
+          }
+
+          await db
+            .prepare("DELETE FROM oauth_states WHERE state = ?")
+            .bind(body.state)
+            .run();
+        }
+
         if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
           return jsonResponse(
             {
@@ -1287,13 +1390,6 @@ export default {
         let email = body.email ? String(body.email).trim() : null;
         let displayName = body.display_name || body.name || null;
 
-        if (body.state) {
-          await db
-            .prepare("DELETE FROM oauth_states WHERE state = ?")
-            .bind(body.state)
-            .run();
-        }
-
         if (provider === "github" && body.code) {
           const ghIdentity = await exchangeGitHubCode(
             body.code,
@@ -1303,6 +1399,17 @@ export default {
           providerUserId = providerUserId || ghIdentity.provider_user_id;
           email = email || ghIdentity.email;
           displayName = displayName || ghIdentity.display_name;
+        }
+
+        if (provider === "google" && body.code) {
+          const googleIdentity = await exchangeGoogleCode(
+            body.code,
+            body.redirect_uri,
+            env
+          );
+          providerUserId = providerUserId || googleIdentity.provider_user_id;
+          email = email || googleIdentity.email;
+          displayName = displayName || googleIdentity.display_name;
         }
 
         if (provider === "microsoft" && body.code) {

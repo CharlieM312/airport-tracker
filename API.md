@@ -150,7 +150,7 @@ Supports signing in with **GitHub, Google, Microsoft (Entra / Personal), and App
 1. **`GET /api/oauth/providers` (or `POST /api/oauth/options`)**: Issues a one-time CSRF `state` token in `oauth_states` and returns configured provider Client IDs (`GITHUB_CLIENT_ID`, `GOOGLE_CLIENT_ID`, `MICROSOFT_CLIENT_ID`, `APPLE_CLIENT_ID`).
 2. **`POST /api/oauth/login`**:
    - Accepts `{ provider: "github" | "google" | "microsoft" | "apple", state?, code?, redirect_uri?, id_token?, provider_user_id?, email?, display_name?, username?, totp_code? }`.
-   - When `provider === "github"` and `code` is provided, the Worker exchanges `code` with `https://github.com/login/oauth/access_token` (using `env.GITHUB_CLIENT_ID` and `env.GITHUB_CLIENT_SECRET`) and fetches the profile from `https://api.github.com/user` (with fallback to `/user/emails`).
+   - Exchanges authorization `code` values automatically for **GitHub** (`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`), **Google** (`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` via `https://oauth2.googleapis.com/token`), and **Microsoft** (`MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` via `https://login.microsoftonline.com/common/oauth2/v2.0/token`).
    - **If already linked to an `'approved'` user**: Issues a `session_token` and returns `{ success: true, token, username, provider, role, is_admin, status: "approved" }`.
    - **If new user (or `'pending'` user)**: Creates the user with `status = 'pending'` in `users` and links their OAuth identity in `user_oauth_accounts`, returning `202 Accepted` (or `403` on subsequent attempts while still pending):
      ```json

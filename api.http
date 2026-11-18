@@ -1,0 +1,200 @@
+# =============================================================================
+# Airport Tracker API — VS Code REST Client Collection
+# Install VS Code Extension: "REST Client" (humao.rest-client)
+# =============================================================================
+
+@baseUrl = https://charlie-meader.com
+# @baseUrl = http://localhost:8787
+
+# Paste your generated `atk_...` API key here (or use `{{$dotenv ATK_API_KEY}}` if you created a `.env` file):
+@token = {{$dotenv ATK_API_KEY}}
+@username = CharlieM312
+
+
+# =============================================================================
+# 1. AUTHENTICATION & API KEY BOOTSTRAP
+# =============================================================================
+
+### Step 1: Login with Username & Password (+ optional 6-digit TOTP code)
+# @name login
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{
+  "username": "{{username}}",
+  "password": "your-password",
+  "totp_code": ""
+}
+
+### Step 2: Generate a Personal Access Token (`atk_...`) using the login session above
+# @name createApiKey
+POST {{baseUrl}}/api/api-keys
+Authorization: Bearer {{login.response.body.token}}
+Content-Type: application/json
+
+{
+  "label": "VS Code REST Client",
+  "expires_in_days": 365
+}
+
+
+# =============================================================================
+# 2. ACCOUNT, 2FA, SESSIONS & API KEYS (Uses `@token` / `atk_...`)
+# =============================================================================
+
+### Check 2FA, Passkeys, Linked OAuth Accounts & Admin Status
+GET {{baseUrl}}/api/2fa/status
+Authorization: Bearer {{token}}
+
+### List Personal Access Tokens / API Keys
+GET {{baseUrl}}/api/api-keys
+Authorization: Bearer {{token}}
+
+### Revoke an API Key by ID
+DELETE {{baseUrl}}/api/api-keys/1
+Authorization: Bearer {{token}}
+
+### List Active Multi-Device Sessions
+GET {{baseUrl}}/api/sessions
+Authorization: Bearer {{token}}
+
+### Revoke All Other Device Sessions
+DELETE {{baseUrl}}/api/sessions?all_others=true
+Authorization: Bearer {{token}}
+
+### Change / Set Password (PBKDF2-SHA256)
+PATCH {{baseUrl}}/api/user/password
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "current_password": "your-current-password",
+  "new_password": "your-new-secure-password",
+  "revoke_other_sessions": false
+}
+
+### Edit Your Own Username (Updates users, airport_visits, passkeys, OAuth, sessions & API keys)
+PATCH {{baseUrl}}/api/user/username
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "new_username": "CharlieM312"
+}
+
+
+# =============================================================================
+# 3. ADMIN USER APPROVAL & MANAGEMENT (Requires Admin `@token`)
+# =============================================================================
+
+### List All Users & Pending Approval Queue
+GET {{baseUrl}}/api/admin/users
+Authorization: Bearer {{token}}
+
+### List Only Pending Users
+GET {{baseUrl}}/api/admin/users?status=pending
+Authorization: Bearer {{token}}
+
+### Approve (or Reject / Rename) a User
+PATCH {{baseUrl}}/api/admin/users/pending_user
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "status": "approved",
+  "role": "user"
+}
+
+### Delete a Pending or Rejected User
+DELETE {{baseUrl}}/api/admin/users/pending_user
+Authorization: Bearer {{token}}
+
+
+# =============================================================================
+# 4. PUBLIC READ ENDPOINTS (Visits, Airports & Travel Stats)
+# =============================================================================
+
+### Get Logged Airport Visits
+GET {{baseUrl}}/api/visits?username={{username}}&limit=50
+
+### Get Distinct Visited Airports
+GET {{baseUrl}}/api/visits/airports?username={{username}}&distinct=true
+
+### Get Travel Statistics & Total Distance Flown
+GET {{baseUrl}}/api/stats?username={{username}}
+
+### Search Reference Airports by City / Name / IATA Code
+GET {{baseUrl}}/api/airports?search=London
+
+### Lookup Single Reference Airport by IATA Code
+GET {{baseUrl}}/api/airports?code=LHR
+
+
+# =============================================================================
+# 5. PROTECTED WRITE ENDPOINTS (Log, Edit & Delete Visits using `@token`)
+# =============================================================================
+
+### Log a Single Airport Visit (Auto-calculates Haversine distance_km from origin_iata)
+POST {{baseUrl}}/api/visits
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "iata_code": "HAM",
+  "origin_iata": "LHR",
+  "visit_date": "2026-11-18",
+  "flight_number": "BA968",
+  "notes": "Logged from VS Code REST Client"
+}
+
+### Batch Log Multiple Visits in an Atomic D1 Transaction
+POST {{baseUrl}}/api/visits/batch
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "visits": [
+    {
+      "iata_code": "NCL",
+      "origin_iata": "LHR",
+      "visit_date": "2026-10-12",
+      "flight_number": "BA1326",
+      "notes": "Domestic flight north"
+    },
+    {
+      "iata_code": "AMS",
+      "origin_iata": "NCL",
+      "visit_date": "2026-10-14",
+      "flight_number": "KL958",
+      "notes": "Hop across the North Sea"
+    }
+  ]
+}
+
+### Edit an Existing Visit by ID
+PATCH {{baseUrl}}/api/visits/1
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "flight_number": "BA968",
+  "notes": "Updated notes via REST Client"
+}
+
+### Delete a Visit by ID
+DELETE {{baseUrl}}/api/visits/1
+Authorization: Bearer {{token}}
+
+### Add or Update an Airport in the Reference Table
+POST {{baseUrl}}/api/airports
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "iata_code": "LHR",
+  "name": "London Heathrow Airport",
+  "city": "London",
+  "country": "United Kingdom",
+  "latitude": 51.4700,
+  "longitude": -0.4543
+}

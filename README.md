@@ -2,6 +2,8 @@
 
 A serverless Cloudflare Worker + D1 database backend for tracking airport visits, flight routes, great-circle distances, and travel statistics.
 
+[![Test](https://github.com/CharlieM312/website/airport-tracker/workflows/test.yml/badge.svg?branch=main)](https://github.com/CharlieM312/airport-tracker/actions/workflows/test.yml)
+
 ## Documentation
 
 - **[API Reference (`API.md`)](./API.md)** — Full documentation of all public & protected endpoints, query parameters, database schema, and JSON payloads for frontend integration.
@@ -32,3 +34,4 @@ npx wrangler deploy
 - `migrations/0005_2fa_and_webauthn.sql` — Adds `totp_secret`, `totp_pending_secret`, and `webauthn_challenge` to `users` and creates `user_passkeys` for Microsoft Authenticator (TOTP) and multiple YubiKeys/Passkeys (`WebAuthn`).
 - `migrations/0006_oauth_and_admin_approval.sql` — Adds `role`, `status` (`'pending' | 'approved' | 'rejected'`), and `email` to `users`, and creates `user_oauth_accounts` & `oauth_states` for GitHub, Google, Microsoft, and Apple OAuth with Admin Approval gating.
 - `wrangler.jsonc` — Cloudflare Worker & D1 binding configuration.
+

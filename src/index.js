@@ -2,10 +2,16 @@
  * Airport Tracker Worker API
  *
  * Authentication, 2FA, WebAuthn, OAuth & Admin Approval Endpoints:
- * - POST   /api/login                     (Validates username, password, account approval status, and optional 6-digit TOTP code)
- * - POST   /api/register                  (Creates a 'pending' account request awaiting admin approval)
- * - POST   /api/logout                    (Clears the active session_token in `users`)
- * - PATCH  /api/user/username             (Protected: renames the signed-in user across users, visits, passkeys, and OAuth links)
+ * - POST   /api/login                     (Validates username, PBKDF2/plaintext password, brute-force lockout, approval status, and optional TOTP)
+ * - POST   /api/register                  (Creates a 'pending' account request with PBKDF2-hashed password awaiting admin approval)
+ * - POST   /api/logout                    (Revokes the active session token in `user_sessions` and `users`)
+ * - PATCH  /api/user/username             (Protected: renames the signed-in user across all tables)
+ * - PATCH  /api/user/password             (Protected: changes or sets the signed-in user's password using PBKDF2-SHA256)
+ * - GET    /api/sessions                  (Protected: lists active multi-device sessions for the signed-in user)
+ * - DELETE /api/sessions                  (Protected: revokes a specific session by id or all other sessions)
+ * - GET    /api/api-keys                  (Protected: lists personal access tokens / API keys for the signed-in user)
+ * - POST   /api/api-keys                  (Protected: generates a new `atk_...` personal access token)
+ * - DELETE /api/api-keys                  (Protected: revokes a personal access token by id)
  * - GET    /api/oauth/providers           (Public: lists supported OAuth providers [github, google, microsoft, apple] & client IDs)
  * - POST   /api/oauth/options             (Public: generates CSRF state nonce & returns provider config)
  * - POST   /api/oauth/login               (Public: signs in an approved OAuth user or creates a 'pending' account for admin approval)
@@ -42,6 +48,10 @@
 const EARTH_RADIUS_KM = 6371;
 const KM_TO_MILES = 0.621371;
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const PBKDF2_ITERATIONS = 100000;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -155,6 +165,92 @@ function bytesToBase64Url(bytes) {
     binary += String.fromCharCode(b);
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Compute SHA-256 hex digest using Web Crypto (used for hashing API keys).
+ */
+async function sha256Hex(input) {
+  const bytes = new TextEncoder().encode(String(input || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Check whether a stored password value is already in PBKDF2 format (`pbkdf2$<iterations>$<salt>$<hash>`).
+ */
+function isHashedPassword(stored) {
+  return typeof stored === "string" && stored.startsWith("pbkdf2$");
+}
+
+/**
+ * Hash a plaintext password using Web Crypto PBKDF2-SHA256.
+ */
+async function hashPassword(plainPassword, saltBytes = null, iterations = PBKDF2_ITERATIONS) {
+  const salt = saltBytes || crypto.getRandomValues(new Uint8Array(16));
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(String(plainPassword)),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations,
+      hash: "SHA-256",
+    },
+    baseKey,
+    256
+  );
+  return `pbkdf2$${iterations}$${bytesToBase64Url(salt)}$${bytesToBase64Url(
+    new Uint8Array(derivedBits)
+  )}`;
+}
+
+/**
+ * Verify a user's password against either a PBKDF2 hash or a legacy plaintext password.
+ * Automatically upgrades legacy plaintext passwords in D1 to PBKDF2-SHA256 upon successful verification.
+ */
+async function verifyUserPassword(db, user, inputPassword) {
+  if (!user || !user.password || !inputPassword) {
+    return false;
+  }
+
+  const stored = String(user.password);
+  if (isHashedPassword(stored)) {
+    const parts = stored.split("$");
+    if (parts.length !== 4) return false;
+    const iterations = parseInt(parts[1], 10) || PBKDF2_ITERATIONS;
+    const salt = base64UrlToBytes(parts[2]);
+    const expectedHash = await hashPassword(inputPassword, salt, iterations);
+    if (expectedHash.length !== stored.length) return false;
+    let diff = 0;
+    for (let i = 0; i < stored.length; i++) {
+      diff |= stored.charCodeAt(i) ^ expectedHash.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  // Legacy plaintext comparison + automatic upgrade to PBKDF2-SHA256
+  if (stored === String(inputPassword)) {
+    try {
+      const upgradedHash = await hashPassword(inputPassword);
+      await db
+        .prepare("UPDATE users SET password = ? WHERE username = ?")
+        .bind(upgradedHash, user.username)
+        .run();
+    } catch {
+      // Non-fatal if upgrade write fails
+    }
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -274,6 +370,190 @@ async function ensureOAuthTables(db) {
       )`
     )
     .run();
+}
+
+/**
+ * Ensure security hardening columns (`failed_login_attempts`, `locked_until`) and tables
+ * (`user_sessions`, `user_api_keys`) exist.
+ */
+async function ensureSecurityTables(db) {
+  try {
+    await db
+      .prepare(
+        "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0"
+      )
+      .run();
+  } catch {
+    // Column already exists
+  }
+  try {
+    await db
+      .prepare("ALTER TABLE users ADD COLUMN locked_until INTEGER")
+      .run();
+  } catch {
+    // Column already exists
+  }
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS user_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+        token TEXT NOT NULL UNIQUE,
+        user_agent TEXT,
+        ip_address TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at INTEGER NOT NULL
+      )`
+    )
+    .run();
+
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS user_api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+        label TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_used_at DATETIME,
+        expires_at INTEGER
+      )`
+    )
+    .run();
+
+  // Auto-migrate any existing plain-text passwords in `users` to PBKDF2-SHA256
+  try {
+    const { results: plainUsers } = await db
+      .prepare(
+        "SELECT username, password FROM users WHERE password IS NOT NULL AND password != '' AND password NOT LIKE 'pbkdf2$%'"
+      )
+      .all();
+
+    for (const row of plainUsers || []) {
+      if (row.password && !isHashedPassword(row.password)) {
+        const hashed = await hashPassword(row.password);
+        await db
+          .prepare("UPDATE users SET password = ? WHERE username = ?")
+          .bind(hashed, row.username)
+          .run();
+      }
+    }
+  } catch {
+    // Non-fatal if users table is not initialized yet
+  }
+}
+
+/**
+ * Check if a user account is currently locked due to brute-force login attempts.
+ */
+function checkAccountLockout(user) {
+  if (!user || !user.locked_until) return null;
+  const lockedUntilMs = Number(user.locked_until);
+  const nowMs = Date.now();
+  if (Number.isFinite(lockedUntilMs) && lockedUntilMs > nowMs) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((lockedUntilMs - nowMs) / 1000));
+    const minutes = Math.ceil(retryAfterSeconds / 60);
+    return jsonResponse(
+      {
+        error: `Too many failed login attempts. Account is locked for ${minutes} minute(s).`,
+        locked: true,
+        retry_after_seconds: retryAfterSeconds,
+      },
+      { status: 429 }
+    );
+  }
+  return null;
+}
+
+/**
+ * Increment failed login attempts and lock the account for 15 minutes after 5 consecutive failures.
+ */
+async function recordFailedLoginAttempt(db, user) {
+  if (!user || !user.username) return null;
+  await ensureSecurityTables(db);
+  const nowMs = Date.now();
+  // If a previous lockout already expired, restart counter at 1
+  const wasExpiredLock =
+    user.locked_until && Number(user.locked_until) <= nowMs;
+  const baseAttempts = wasExpiredLock
+    ? 0
+    : Number(user.failed_login_attempts || 0);
+  const nextAttempts = baseAttempts + 1;
+  const lockedUntil =
+    nextAttempts >= MAX_FAILED_LOGIN_ATTEMPTS
+      ? nowMs + LOCKOUT_DURATION_MS
+      : null;
+
+  await db
+    .prepare(
+      "UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE username = ?"
+    )
+    .bind(nextAttempts, lockedUntil, user.username)
+    .run();
+
+  return {
+    attempts: nextAttempts,
+    locked: Boolean(lockedUntil),
+    locked_until: lockedUntil,
+    remaining_attempts: Math.max(0, MAX_FAILED_LOGIN_ATTEMPTS - nextAttempts),
+  };
+}
+
+/**
+ * Reset failed login counter and clear any lockout after a successful sign-in.
+ */
+async function clearFailedLoginAttempts(db, username) {
+  try {
+    await ensureSecurityTables(db);
+    await db
+      .prepare(
+        "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE username = ?"
+      )
+      .bind(username)
+      .run();
+  } catch {
+    // Non-fatal
+  }
+}
+
+/**
+ * Create a new multi-device session row in `user_sessions` (and update `users.session_token` for compatibility).
+ */
+async function createUserSession(db, request, username) {
+  await ensureSecurityTables(db);
+  const sessionToken = crypto.randomUUID();
+  const nowMs = Date.now();
+  const expiresAt = nowMs + SESSION_TTL_MS;
+  const userAgent =
+    (request.headers.get("User-Agent") || "Browser").slice(0, 255);
+  const ipAddress =
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("X-Forwarded-For") ||
+    null;
+
+  // Prune any expired sessions for cleanliness
+  await db
+    .prepare("DELETE FROM user_sessions WHERE expires_at < ?")
+    .bind(nowMs)
+    .run();
+
+  await db
+    .prepare(
+      `INSERT INTO user_sessions (username, token, user_agent, ip_address, expires_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(username, sessionToken, userAgent, ipAddress, expiresAt)
+    .run();
+
+  await db
+    .prepare("UPDATE users SET session_token = ? WHERE username = ?")
+    .bind(sessionToken, username)
+    .run();
+
+  return { token: sessionToken, expires_at: expiresAt };
 }
 
 /**
@@ -624,6 +904,7 @@ async function renameUsernameInDb(db, oldUsername, rawNewUsername) {
 
   await getUserPasskeys(db, oldUsername);
   await ensureOAuthTables(db);
+  await ensureSecurityTables(db);
 
   await db.batch([
     db.prepare("PRAGMA defer_foreign_keys = ON"),
@@ -638,6 +919,12 @@ async function renameUsernameInDb(db, oldUsername, rawNewUsername) {
       .bind(newUsername, oldUsername),
     db
       .prepare("UPDATE user_oauth_accounts SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+    db
+      .prepare("UPDATE user_sessions SET username = ? WHERE username = ?")
+      .bind(newUsername, oldUsername),
+    db
+      .prepare("UPDATE user_api_keys SET username = ? WHERE username = ?")
       .bind(newUsername, oldUsername),
   ]);
 
@@ -691,7 +978,150 @@ async function authenticateRequest(request, env, db) {
     };
   }
 
-  // 1. Check session_token in D1 `users` table
+  // 1. Check if token is a Personal Access Token / API key (`atk_...`)
+  if (token.startsWith("atk_")) {
+    try {
+      await ensureSecurityTables(db);
+      const keyHash = await sha256Hex(token);
+      const apiKeyRow = await db
+        .prepare("SELECT * FROM user_api_keys WHERE key_hash = ?")
+        .bind(keyHash)
+        .first();
+
+      if (!apiKeyRow) {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            { error: "Unauthorized: Invalid or revoked API key" },
+            { status: 401 }
+          ),
+        };
+      }
+
+      if (apiKeyRow.expires_at && Number(apiKeyRow.expires_at) < Date.now()) {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            { error: "Unauthorized: API key has expired" },
+            { status: 401 }
+          ),
+        };
+      }
+
+      const user = await db
+        .prepare("SELECT * FROM users WHERE username = ?")
+        .bind(apiKeyRow.username)
+        .first();
+
+      if (!user) {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            { error: "Unauthorized: User for API key not found" },
+            { status: 401 }
+          ),
+        };
+      }
+
+      const accountStatus = user.status || "approved";
+      if (accountStatus !== "approved") {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            {
+              error: "Account is not approved",
+              status: accountStatus,
+            },
+            { status: 403 }
+          ),
+        };
+      }
+
+      await db
+        .prepare(
+          "UPDATE user_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
+        )
+        .bind(apiKeyRow.id)
+        .run();
+
+      user.isAdmin = isUserAdmin(user);
+      user.role = user.isAdmin ? "admin" : user.role || "user";
+      user.status = accountStatus;
+      user.authType = "api_key";
+      user.apiKeyId = apiKeyRow.id;
+      return { user, errorResponse: null };
+    } catch {
+      // Fall through if user_api_keys table check fails
+    }
+  }
+
+  // 2. Check multi-device `user_sessions` table (with 30-day expiry)
+  try {
+    await ensureSecurityTables(db);
+    const sessionRow = await db
+      .prepare("SELECT * FROM user_sessions WHERE token = ?")
+      .bind(token)
+      .first();
+
+    if (sessionRow) {
+      if (sessionRow.expires_at && Number(sessionRow.expires_at) < Date.now()) {
+        await db
+          .prepare("DELETE FROM user_sessions WHERE id = ?")
+          .bind(sessionRow.id)
+          .run();
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            { error: "Unauthorized: Session has expired" },
+            { status: 401 }
+          ),
+        };
+      }
+
+      const user = await db
+        .prepare("SELECT * FROM users WHERE username = ?")
+        .bind(sessionRow.username)
+        .first();
+
+      if (user) {
+        const accountStatus = user.status || "approved";
+        if (accountStatus !== "approved") {
+          return {
+            user: null,
+            errorResponse: jsonResponse(
+              {
+                error:
+                  accountStatus === "pending"
+                    ? "Your account is awaiting admin approval"
+                    : "Your account is not approved",
+                status: accountStatus,
+                pending_approval: accountStatus === "pending",
+              },
+              { status: 403 }
+            ),
+          };
+        }
+
+        await db
+          .prepare(
+            "UPDATE user_sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
+          )
+          .bind(sessionRow.id)
+          .run();
+
+        user.isAdmin = isUserAdmin(user);
+        user.role = user.isAdmin ? "admin" : user.role || "user";
+        user.status = accountStatus;
+        user.currentSessionToken = token;
+        user.currentSessionId = sessionRow.id;
+        return { user, errorResponse: null };
+      }
+    }
+  } catch {
+    // Fall through to legacy session_token check
+  }
+
+  // 3. Fallback: check legacy `users.session_token` column
   try {
     const user = await db
       .prepare("SELECT * FROM users WHERE session_token = ?")
@@ -719,6 +1149,7 @@ async function authenticateRequest(request, env, db) {
       user.isAdmin = isUserAdmin(user);
       user.role = user.isAdmin ? "admin" : user.role || "user";
       user.status = accountStatus;
+      user.currentSessionToken = token;
       return { user, errorResponse: null };
     }
   } catch {
@@ -836,14 +1267,42 @@ export default {
           );
         }
 
+        await ensureSecurityTables(db);
         const user = await db
-          .prepare("SELECT * FROM users WHERE username = ? AND password = ?")
-          .bind(username, password)
+          .prepare("SELECT * FROM users WHERE username = ?")
+          .bind(username)
           .first();
 
         if (!user) {
           return jsonResponse(
             { error: "Invalid username or password" },
+            { status: 401 }
+          );
+        }
+
+        // Check if account is temporarily locked due to brute-force attempts
+        const lockoutResponse = checkAccountLockout(user);
+        if (lockoutResponse) return lockoutResponse;
+
+        // Verify password against PBKDF2-SHA256 hash (or auto-migrate legacy plaintext password)
+        const isPasswordValid = await verifyUserPassword(db, user, password);
+        if (!isPasswordValid) {
+          const failInfo = await recordFailedLoginAttempt(db, user);
+          if (failInfo && failInfo.locked) {
+            return jsonResponse(
+              {
+                error: "Too many failed login attempts. Account locked for 15 minutes.",
+                locked: true,
+                retry_after_seconds: Math.ceil(LOCKOUT_DURATION_MS / 1000),
+              },
+              { status: 429 }
+            );
+          }
+          return jsonResponse(
+            {
+              error: "Invalid username or password",
+              remaining_attempts: failInfo ? failInfo.remaining_attempts : undefined,
+            },
             { status: 401 }
           );
         }
@@ -881,23 +1340,36 @@ export default {
           }
           const isValidTotp = await verifyTotp(user.totp_secret, totp_code);
           if (!isValidTotp) {
+            const failInfo = await recordFailedLoginAttempt(db, user);
+            if (failInfo && failInfo.locked) {
+              return jsonResponse(
+                {
+                  error:
+                    "Too many failed Authenticator code attempts. Account locked for 15 minutes.",
+                  locked: true,
+                  retry_after_seconds: Math.ceil(LOCKOUT_DURATION_MS / 1000),
+                },
+                { status: 429 }
+              );
+            }
             return jsonResponse(
-              { error: "Invalid 6-digit Authenticator code" },
+              {
+                error: "Invalid 6-digit Authenticator code",
+                remaining_attempts: failInfo ? failInfo.remaining_attempts : undefined,
+              },
               { status: 401 }
             );
           }
         }
 
-        const sessionToken = crypto.randomUUID();
-        await db
-          .prepare("UPDATE users SET session_token = ? WHERE username = ?")
-          .bind(sessionToken, user.username)
-          .run();
+        await clearFailedLoginAttempts(db, user.username);
+        const session = await createUserSession(db, request, user.username);
 
         const adminFlag = isUserAdmin(user);
         return jsonResponse({
           success: true,
-          token: sessionToken,
+          token: session.token,
+          expires_at: session.expires_at,
           username: user.username,
           role: adminFlag ? "admin" : user.role || "user",
           is_admin: adminFlag,
@@ -923,6 +1395,16 @@ export default {
           );
         }
 
+        if (String(password).length < 8) {
+          return jsonResponse(
+            { error: "Password must be at least 8 characters long" },
+            { status: 400 }
+          );
+        }
+
+        await ensureOAuthTables(db);
+        await ensureSecurityTables(db);
+
         const existing = await db
           .prepare("SELECT username, status FROM users WHERE LOWER(username) = LOWER(?)")
           .bind(cleanUsername)
@@ -935,22 +1417,13 @@ export default {
           );
         }
 
-        try {
-          await db
-            .prepare(
-              "INSERT INTO users (username, password, email, role, status) VALUES (?, ?, ?, 'user', 'pending')"
-            )
-            .bind(cleanUsername, password, email || null)
-            .run();
-        } catch {
-          return jsonResponse(
-            {
-              error:
-                "Database migration 0006_oauth_and_admin_approval.sql is required before registering pending users.",
-            },
-            { status: 500 }
-          );
-        }
+        const passwordHash = await hashPassword(password);
+        await db
+          .prepare(
+            "INSERT INTO users (username, password, email, role, status) VALUES (?, ?, ?, 'user', 'pending')"
+          )
+          .bind(cleanUsername, passwordHash, email || null)
+          .run();
 
         return jsonResponse(
           {
@@ -1203,6 +1676,9 @@ export default {
             return jsonResponse({ error: "Linked user account no longer exists" }, { status: 404 });
           }
 
+          const lockoutResponse = checkAccountLockout(user);
+          if (lockoutResponse) return lockoutResponse;
+
           const accountStatus = user.status || "approved";
           if (accountStatus === "pending") {
             return jsonResponse(
@@ -1232,6 +1708,18 @@ export default {
           if (user.totp_secret && body.totp_code) {
             const isValidTotp = await verifyTotp(user.totp_secret, body.totp_code);
             if (!isValidTotp) {
+              const failInfo = await recordFailedLoginAttempt(db, user);
+              if (failInfo && failInfo.locked) {
+                return jsonResponse(
+                  {
+                    error:
+                      "Too many failed Authenticator code attempts. Account locked for 15 minutes.",
+                    locked: true,
+                    retry_after_seconds: Math.ceil(LOCKOUT_DURATION_MS / 1000),
+                  },
+                  { status: 429 }
+                );
+              }
               return jsonResponse(
                 { error: "Invalid 6-digit Authenticator code" },
                 { status: 401 }
@@ -1239,16 +1727,14 @@ export default {
             }
           }
 
-          const sessionToken = crypto.randomUUID();
-          await db
-            .prepare("UPDATE users SET session_token = ? WHERE username = ?")
-            .bind(sessionToken, user.username)
-            .run();
+          await clearFailedLoginAttempts(db, user.username);
+          const session = await createUserSession(db, request, user.username);
 
           const adminFlag = isUserAdmin(user);
           return jsonResponse({
             success: true,
-            token: sessionToken,
+            token: session.token,
+            expires_at: session.expires_at,
             username: user.username,
             provider,
             role: adminFlag ? "admin" : user.role || "user",
@@ -1592,16 +2078,24 @@ export default {
             );
           }
 
-          // Clear session_token if account is rejected or moved back to pending
+          // Clear session_token and user_sessions if account is rejected or moved back to pending
           const nextSessionToken =
             nextStatus === "approved" ? existingUser.session_token : null;
 
+          await ensureSecurityTables(db);
           await db
             .prepare(
-              "UPDATE users SET status = ?, role = ?, session_token = ? WHERE username = ?"
+              "UPDATE users SET status = ?, role = ?, session_token = ?, failed_login_attempts = 0, locked_until = NULL WHERE username = ?"
             )
             .bind(nextStatus, nextRole, nextSessionToken, targetUsername)
             .run();
+
+          if (nextStatus !== "approved") {
+            await db
+              .prepare("DELETE FROM user_sessions WHERE username = ?")
+              .bind(targetUsername)
+              .run();
+          }
 
           let finalUsername = targetUsername;
           if (body.new_username && String(body.new_username).trim() !== targetUsername) {
@@ -1659,6 +2153,15 @@ export default {
             );
           }
 
+          await ensureSecurityTables(db);
+          await db
+            .prepare("DELETE FROM user_sessions WHERE username = ?")
+            .bind(targetUsername)
+            .run();
+          await db
+            .prepare("DELETE FROM user_api_keys WHERE username = ?")
+            .bind(targetUsername)
+            .run();
           await db
             .prepare("DELETE FROM user_oauth_accounts WHERE username = ?")
             .bind(targetUsername)
@@ -1738,6 +2241,319 @@ export default {
     }
 
     // =========================================================================
+    // PATCH or POST /api/user/password - Change or set password with PBKDF2-SHA256 (Protected)
+    // =========================================================================
+    if (
+      (request.method === "PATCH" ||
+        request.method === "PUT" ||
+        request.method === "POST") &&
+      url.pathname === "/api/user/password"
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to change your password" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        const body = await request.json();
+        const currentPassword = body.current_password || "";
+        const newPassword = body.new_password || body.password || "";
+
+        if (!newPassword || String(newPassword).length < 8) {
+          return jsonResponse(
+            { error: "New password must be at least 8 characters long" },
+            { status: 400 }
+          );
+        }
+
+        const userRow = await db
+          .prepare("SELECT * FROM users WHERE username = ?")
+          .bind(user.username)
+          .first();
+
+        if (!userRow) {
+          return jsonResponse({ error: "User not found" }, { status: 404 });
+        }
+
+        // If user already has a password set, verify current_password before changing
+        if (userRow.password && String(userRow.password).length > 0) {
+          if (!currentPassword) {
+            return jsonResponse(
+              { error: "Current password is required to change your password" },
+              { status: 400 }
+            );
+          }
+          const validCurrent = await verifyUserPassword(
+            db,
+            userRow,
+            currentPassword
+          );
+          if (!validCurrent) {
+            return jsonResponse(
+              { error: "Current password is incorrect" },
+              { status: 401 }
+            );
+          }
+        }
+
+        const newPasswordHash = await hashPassword(newPassword);
+        await db
+          .prepare("UPDATE users SET password = ? WHERE username = ?")
+          .bind(newPasswordHash, user.username)
+          .run();
+
+        // Optionally revoke all other sessions if revoke_other_sessions is requested
+        if (body.revoke_other_sessions && user.currentSessionToken) {
+          await ensureSecurityTables(db);
+          await db
+            .prepare(
+              "DELETE FROM user_sessions WHERE username = ? AND token != ?"
+            )
+            .bind(user.username, user.currentSessionToken)
+            .run();
+        }
+
+        return jsonResponse({
+          success: true,
+          has_password: true,
+          message: "Password updated and hashed with PBKDF2-SHA256.",
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // GET & DELETE /api/sessions - Multi-Device Active Sessions Manager (Protected)
+    // =========================================================================
+    if (
+      url.pathname === "/api/sessions" ||
+      url.pathname.startsWith("/api/sessions/")
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse({ sessions: [] });
+      }
+
+      try {
+        await ensureSecurityTables(db);
+        const nowMs = Date.now();
+
+        if (request.method === "GET") {
+          await db
+            .prepare("DELETE FROM user_sessions WHERE expires_at < ?")
+            .bind(nowMs)
+            .run();
+
+          const { results } = await db
+            .prepare(
+              "SELECT id, token, user_agent, ip_address, created_at, last_used_at, expires_at FROM user_sessions WHERE username = ? ORDER BY last_used_at DESC, id DESC"
+            )
+            .bind(user.username)
+            .all();
+
+          const sessions = (results || []).map((s) => ({
+            id: s.id,
+            user_agent: s.user_agent || "Browser",
+            ip_address: s.ip_address || null,
+            created_at: s.created_at,
+            last_used_at: s.last_used_at,
+            expires_at: s.expires_at,
+            is_current: Boolean(
+              user.currentSessionToken && s.token === user.currentSessionToken
+            ),
+          }));
+
+          return jsonResponse({
+            username: user.username,
+            sessions,
+          });
+        }
+
+        if (request.method === "DELETE") {
+          const pathId = url.pathname.startsWith("/api/sessions/")
+            ? url.pathname.slice("/api/sessions/".length)
+            : null;
+          let body = {};
+          try {
+            body = await request.json();
+          } catch {
+            // Optional JSON body
+          }
+
+          const allOthers =
+            url.searchParams.get("all_others") === "true" ||
+            body.all_others === true;
+          const sessionId = pathId || url.searchParams.get("id") || body.id;
+
+          if (allOthers) {
+            if (user.currentSessionToken) {
+              await db
+                .prepare(
+                  "DELETE FROM user_sessions WHERE username = ? AND token != ?"
+                )
+                .bind(user.username, user.currentSessionToken)
+                .run();
+            } else {
+              await db
+                .prepare("DELETE FROM user_sessions WHERE username = ?")
+                .bind(user.username)
+                .run();
+            }
+            return jsonResponse({
+              success: true,
+              revoked: "all_others",
+            });
+          }
+
+          if (!sessionId) {
+            return jsonResponse(
+              { error: "Specify session id or all_others=true to revoke" },
+              { status: 400 }
+            );
+          }
+
+          await db
+            .prepare("DELETE FROM user_sessions WHERE username = ? AND id = ?")
+            .bind(user.username, sessionId)
+            .run();
+
+          return jsonResponse({
+            success: true,
+            revoked_id: Number(sessionId),
+          });
+        }
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // GET, POST & DELETE /api/api-keys - Personal Access Tokens / API Keys (Protected)
+    // =========================================================================
+    if (
+      url.pathname === "/api/api-keys" ||
+      url.pathname.startsWith("/api/api-keys/")
+    ) {
+      const { user, errorResponse } = await authenticateRequest(request, env, db);
+      if (errorResponse) return errorResponse;
+      if (!user.username) {
+        return jsonResponse(
+          { error: "Please sign in with a user account to manage API keys" },
+          { status: 400 }
+        );
+      }
+
+      try {
+        await ensureSecurityTables(db);
+        const nowMs = Date.now();
+
+        if (request.method === "GET") {
+          const { results } = await db
+            .prepare(
+              "SELECT id, label, key_prefix, created_at, last_used_at, expires_at FROM user_api_keys WHERE username = ? ORDER BY id DESC"
+            )
+            .bind(user.username)
+            .all();
+
+          const apiKeys = (results || []).map((k) => ({
+            id: k.id,
+            label: k.label,
+            key_prefix: k.key_prefix,
+            created_at: k.created_at,
+            last_used_at: k.last_used_at || null,
+            expires_at: k.expires_at || null,
+            expired: Boolean(k.expires_at && Number(k.expires_at) < nowMs),
+          }));
+
+          return jsonResponse({
+            username: user.username,
+            api_keys: apiKeys,
+          });
+        }
+
+        if (request.method === "POST") {
+          const body = await request.json();
+          const label = String(body.label || "Personal Access Token").trim();
+          const expiresInDays = body.expires_in_days
+            ? parseInt(body.expires_in_days, 10)
+            : null;
+          const expiresAt =
+            expiresInDays && Number.isFinite(expiresInDays) && expiresInDays > 0
+              ? nowMs + expiresInDays * 24 * 60 * 60 * 1000
+              : null;
+
+          const rawKey = `atk_${bytesToBase64Url(
+            crypto.getRandomValues(new Uint8Array(32))
+          )}`;
+          const keyPrefix = `${rawKey.slice(0, 12)}...`;
+          const keyHash = await sha256Hex(rawKey);
+
+          const info = await db
+            .prepare(
+              `INSERT INTO user_api_keys (username, label, key_prefix, key_hash, expires_at)
+               VALUES (?, ?, ?, ?, ?)`
+            )
+            .bind(user.username, label, keyPrefix, keyHash, expiresAt)
+            .run();
+
+          return jsonResponse(
+            {
+              success: true,
+              api_key: rawKey,
+              key: {
+                id: info.meta?.last_row_id || null,
+                label,
+                key_prefix: keyPrefix,
+                expires_at: expiresAt,
+              },
+              message:
+                "Copy this API key now. For security, only its SHA-256 hash is stored and it cannot be viewed again.",
+            },
+            { status: 201 }
+          );
+        }
+
+        if (request.method === "DELETE") {
+          const pathId = url.pathname.startsWith("/api/api-keys/")
+            ? url.pathname.slice("/api/api-keys/".length)
+            : null;
+          let body = {};
+          try {
+            body = await request.json();
+          } catch {
+            // Optional JSON body
+          }
+          const keyId = pathId || url.searchParams.get("id") || body.id;
+
+          if (!keyId) {
+            return jsonResponse(
+              { error: "Missing required field: id" },
+              { status: 400 }
+            );
+          }
+
+          await db
+            .prepare("DELETE FROM user_api_keys WHERE username = ? AND id = ?")
+            .bind(user.username, keyId)
+            .run();
+
+          return jsonResponse({
+            success: true,
+            revoked_id: Number(keyId),
+          });
+        }
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
     // POST /api/logout - Clear active session token
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/logout") {
@@ -1746,6 +2562,15 @@ export default {
         if (authHeader && authHeader.startsWith("Bearer ")) {
           const token = authHeader.slice("Bearer ".length).trim();
           if (token) {
+            try {
+              await ensureSecurityTables(db);
+              await db
+                .prepare("DELETE FROM user_sessions WHERE token = ?")
+                .bind(token)
+                .run();
+            } catch {
+              // Ignore if user_sessions not initialized
+            }
             await db
               .prepare("UPDATE users SET session_token = NULL WHERE session_token = ?")
               .bind(token)
@@ -1783,6 +2608,7 @@ export default {
           role: adminFlag ? "admin" : (record && record.role) || "user",
           is_admin: adminFlag,
           status: (record && record.status) || "approved",
+          has_password: Boolean(record && record.password),
           totp_enabled: Boolean(record && record.totp_secret),
           webauthn_enabled: passkeys.length > 0,
           passkey_count: passkeys.length,
@@ -2195,9 +3021,13 @@ export default {
           );
         }
 
-        // If password was also supplied by the user, verify it matches
-        if (password !== undefined && password !== "" && user.password !== password) {
-          return jsonResponse({ error: "Invalid username or password" }, { status: 401 });
+        // If password was also supplied by the user, verify it matches (supporting PBKDF2 hash & legacy plaintext)
+        if (password !== undefined && password !== "") {
+          const validPw = await verifyUserPassword(db, user, password);
+          if (!validPw) {
+            await recordFailedLoginAttempt(db, user);
+            return jsonResponse({ error: "Invalid username or password" }, { status: 401 });
+          }
         }
 
         const challenge = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
@@ -2318,11 +3148,15 @@ export default {
         }
 
         if (!isValid) {
+          await recordFailedLoginAttempt(db, user);
           return jsonResponse(
             { error: "Security key signature verification failed" },
             { status: 401 }
           );
         }
+
+        const lockoutResponse = checkAccountLockout(user);
+        if (lockoutResponse) return lockoutResponse;
 
         const accountStatus = user.status || "approved";
         if (accountStatus !== "approved") {
@@ -2339,18 +3173,18 @@ export default {
           );
         }
 
-        const sessionToken = crypto.randomUUID();
+        await clearFailedLoginAttempts(db, user.username);
         await db
-          .prepare(
-            "UPDATE users SET session_token = ?, webauthn_challenge = NULL WHERE username = ?"
-          )
-          .bind(sessionToken, user.username)
+          .prepare("UPDATE users SET webauthn_challenge = NULL WHERE username = ?")
+          .bind(user.username)
           .run();
+        const session = await createUserSession(db, request, user.username);
 
         const adminFlag = isUserAdmin(user);
         return jsonResponse({
           success: true,
-          token: sessionToken,
+          token: session.token,
+          expires_at: session.expires_at,
           username: user.username,
           role: adminFlag ? "admin" : user.role || "user",
           is_admin: adminFlag,

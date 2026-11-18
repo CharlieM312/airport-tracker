@@ -22,15 +22,41 @@ Cloudflare Worker + D1 API for tracking airport visits, flight legs, airport ref
 | :--- | :--- | :--- |
 | `id` | `INTEGER PRIMARY KEY` | Auto-incrementing user ID |
 | `username` | `TEXT NOT NULL UNIQUE` | Unique username (e.g., `CharlieM312`) |
-| `password` | `TEXT NOT NULL` | User password (`''` for OAuth-only accounts) |
+| `password` | `TEXT NOT NULL` | PBKDF2-SHA256 password hash (`pbkdf2$100000$<salt>$<hash>`; legacy plain text auto-upgrades on login; `''` for OAuth-only accounts) |
 | `email` | `TEXT` | Optional user email address |
 | `role` | `TEXT NOT NULL DEFAULT 'user'` | `'admin'` or `'user'` (`CharlieM312` / `id = 1` is `'admin'`) |
 | `status` | `TEXT NOT NULL DEFAULT 'approved'` | `'pending'`, `'approved'`, or `'rejected'` (new OAuth / registered accounts start as `'pending'`) |
-| `session_token` | `TEXT` | Active session token issued by `POST /api/login`, `POST /api/oauth/login`, or `POST /api/webauthn/login-verify` |
+| `session_token` | `TEXT` | Most recent session token (kept alongside `user_sessions` for backwards compatibility) |
 | `totp_secret` | `TEXT` | Active Base32 RFC 6238 TOTP secret for Microsoft / Yubico Authenticator |
 | `totp_pending_secret` | `TEXT` | Unverified Base32 TOTP secret awaiting 6-digit code confirmation |
 | `webauthn_challenge` | `TEXT` | Ephemeral WebAuthn challenge for registration or sign-in |
+| `failed_login_attempts` | `INTEGER NOT NULL DEFAULT 0` | Consecutive failed password or TOTP login attempts |
+| `locked_until` | `INTEGER` | Epoch ms timestamp until which login is locked (15 minutes after 5 consecutive failures) |
 | `created_at` | `DATETIME` | Timestamp when the user was created |
+
+### `user_sessions`
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `INTEGER PRIMARY KEY` | Auto-incrementing session ID |
+| `username` | `TEXT NOT NULL` | Foreign key referencing `users(username) ON DELETE CASCADE ON UPDATE CASCADE` |
+| `token` | `TEXT NOT NULL UNIQUE` | Bearer session token (`crypto.randomUUID()`) |
+| `user_agent` | `TEXT` | Device / browser `User-Agent` string |
+| `ip_address` | `TEXT` | Client IP from `CF-Connecting-IP` |
+| `created_at` | `DATETIME` | Timestamp when the session was created |
+| `last_used_at` | `DATETIME` | Timestamp when the session was last used on a protected endpoint |
+| `expires_at` | `INTEGER NOT NULL` | Epoch ms expiration timestamp (30 days from login) |
+
+### `user_api_keys`
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `INTEGER PRIMARY KEY` | Auto-incrementing API key ID |
+| `username` | `TEXT NOT NULL` | Foreign key referencing `users(username) ON DELETE CASCADE ON UPDATE CASCADE` |
+| `label` | `TEXT NOT NULL` | User-defined label (e.g., `iOS Shortcut`, `CLI Script`) |
+| `key_prefix` | `TEXT NOT NULL` | Display prefix (`atk_7f9aB2c1...`) |
+| `key_hash` | `TEXT NOT NULL UNIQUE` | SHA-256 hex digest of the raw `atk_...` key |
+| `created_at` | `DATETIME` | Timestamp when the key was created |
+| `last_used_at` | `DATETIME` | Timestamp when the key was last used |
+| `expires_at` | `INTEGER` | Optional epoch ms expiration timestamp |
 
 ### `user_oauth_accounts`
 | Column | Type | Description |
@@ -188,7 +214,41 @@ Renames the currently signed-in user's username across `users`, `airport_visits`
 }
 ```
 
-### 12. `GET /api/admin/users`, `PATCH /api/admin/users/:username`, & `DELETE /api/admin/users/:username` *(Admin Only)*
+### 12. `PATCH /api/user/password` (or `POST /api/user/password`) *(Protected)*
+Changes or sets the signed-in user's password using Web Crypto `PBKDF2-SHA256` (`100,000` iterations + random 16-byte salt):
+- If the user already has a password (`has_password: true` in `GET /api/2fa/status`), `current_password` is required and verified first.
+- If the user was created via OAuth (`has_password: false`), they can set a password for the first time by passing `{ "new_password": "your-new-password" }`.
+- Optional `"revoke_other_sessions": true` revokes all other active device sessions upon password change.
+
+### 13. `GET /api/sessions` & `DELETE /api/sessions/:id` *(Protected)*
+Multi-device session management (30-day session TTL):
+- **`GET /api/sessions`**: Lists all active sessions for the signed-in user:
+  ```json
+  {
+    "username": "CharlieM312",
+    "sessions": [
+      {
+        "id": 1,
+        "user_agent": "Mozilla/5.0 ...",
+        "ip_address": "203.0.113.10",
+        "created_at": "2026-11-18 20:55:00",
+        "last_used_at": "2026-11-18 21:00:00",
+        "expires_at": 1797627300000,
+        "is_current": true
+      }
+    ]
+  }
+  ```
+- **`DELETE /api/sessions/:id`** (or `DELETE /api/sessions?id=1`): Revokes a specific device session.
+- **`DELETE /api/sessions?all_others=true`** (or `{ "all_others": true }`): Revokes all sessions except the current device.
+
+### 14. `GET /api/api-keys`, `POST /api/api-keys`, & `DELETE /api/api-keys/:id` *(Protected)*
+Personal Access Tokens (`atk_...`) for logging flights from iOS Shortcuts, scripts, or CLI tools:
+- **`GET /api/api-keys`**: Lists all tokens (`id`, `label`, `key_prefix`, `created_at`, `last_used_at`, `expires_at`, `expired`).
+- **`POST /api/api-keys`**: Accepts `{ "label": "iOS Shortcut", "expires_in_days": 365 }`, stores only the SHA-256 hash in `user_api_keys`, and returns the raw `api_key` (`atk_...`) once (`201 Created`). Use it on any protected endpoint with `Authorization: Bearer atk_...`.
+- **`DELETE /api/api-keys/:id`** (or `DELETE /api/api-keys?id=1`): Revokes the specified API key.
+
+### 15. `GET /api/admin/users`, `PATCH /api/admin/users/:username`, & `DELETE /api/admin/users/:username` *(Admin Only)*
 Admin endpoints for approving, rejecting, renaming, or deleting user accounts:
 - **`GET /api/admin/users`** (optional `?status=pending`): Returns `{ pending_count, total_count, users: [...] }` with each user's `status` (`'pending' | 'approved' | 'rejected'`), `role` (`'admin' | 'user'`), and linked `oauth_accounts`.
 - **`PATCH /api/admin/users/:username`** (or `PATCH /api/admin/users` with `{ username, status?: "approved" | "rejected" | "pending", role?: "admin" | "user", new_username?: "..." }`): Approves or rejects a user account, updates their role, and/or renames their username across all tables.

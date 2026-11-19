@@ -3490,6 +3490,14 @@ export default {
 
         let results;
         try {
+          try {
+            await db
+              .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+              .run();
+          } catch {
+            // Column already exists
+          }
+
           const query = `
             SELECT
               v.id,
@@ -3499,6 +3507,7 @@ export default {
               v.username,
               v.notes,
               v.origin_iata,
+              COALESCE(v.destination_iata, v.iata_code) AS destination_iata,
               v.flight_number,
               v.distance_km,
               a.city,
@@ -3904,16 +3913,16 @@ export default {
           (visit_date && String(visit_date).trim()) ||
           new Date().toISOString().slice(0, 10);
 
-        let destCode = iata_code ? String(iata_code).trim().toUpperCase() : "";
-        const explicitDestCode = body.destination_iata
+        let visitedCode = iata_code ? String(iata_code).trim().toUpperCase() : "";
+        let flightDestCode = body.destination_iata
           ? String(body.destination_iata).trim().toUpperCase()
           : "";
         let gpsDetectedCode = "";
         let detectedFromGps = false;
         let gpsDistanceKm = null;
 
-        // If GPS coordinates are provided and either iata_code is omitted OR destination_iata is given (departure-gate mode)
-        if (hasGps && (!destCode || explicitDestCode)) {
+        // 1. If GPS coordinates are provided and iata_code wasn't explicitly typed, the GPS airport IS the visited airport!
+        if (hasGps && !visitedCode) {
           const maxRadiusKm =
             body.max_distance_km != null && Number.isFinite(Number(body.max_distance_km))
               ? Number(body.max_distance_km)
@@ -3939,12 +3948,9 @@ export default {
           }
 
           gpsDetectedCode = closest.iata_code.toUpperCase();
+          visitedCode = gpsDetectedCode;
           detectedFromGps = true;
           gpsDistanceKm = closest.distance_from_location_km;
-
-          if (!destCode && !explicitDestCode) {
-            destCode = gpsDetectedCode;
-          }
         }
 
         const cleanFlightNumber =
@@ -3957,42 +3963,31 @@ export default {
             ? String(origin_iata).trim().toUpperCase()
             : null;
 
-        // Departure-gate mode: if the user passed `destination_iata` alongside GPS, GPS is their Origin airport!
-        if (explicitDestCode) {
-          if (!origCode && gpsDetectedCode) {
-            origCode = gpsDetectedCode;
-          }
-          destCode = explicitDestCode;
-        }
-
-        // If a flight_number was provided and either origin_iata or explicit iata_code is missing, look up the flight route automatically!
-        const hasExplicitIata = Boolean(
-          (iata_code && String(iata_code).trim()) || explicitDestCode
-        );
+        // 2. If a flight_number was provided, look up its origin & destination (e.g. W43304 -> LTN -> CLJ)
+        //    Visited airport (`visitedCode`) stays the GPS location (e.g. LTN), while `origCode` and `flightDestCode`
+        //    record the flight's origin and destination!
         let resolvedRoute = null;
-        if (cleanFlightNumber && (!origCode || !hasExplicitIata)) {
+        if (cleanFlightNumber && (!origCode || !flightDestCode || !visitedCode)) {
           resolvedRoute = await resolveFlightRoute(db, cleanFlightNumber);
           if (resolvedRoute) {
             if (!origCode && resolvedRoute.origin_iata) {
               origCode = resolvedRoute.origin_iata;
             }
-            // If destCode was not explicitly typed (or GPS detected the departure airport, e.g. LTN for W43304 LTN->CLJ),
-            // use the flight's actual destination airport so we never log LTN -> LTN (0 km)!
-            if (
-              resolvedRoute.destination_iata &&
-              (!hasExplicitIata || destCode === origCode)
-            ) {
-              destCode = resolvedRoute.destination_iata;
+            if (!flightDestCode && resolvedRoute.destination_iata) {
+              flightDestCode = resolvedRoute.destination_iata;
+            }
+            if (!visitedCode) {
+              visitedCode = flightDestCode || origCode || "";
             }
           }
         }
 
-        // Prevent auto-detected origin from equaling destination (0 km self-loop)
-        if (!origin_iata && origCode && destCode && origCode === destCode) {
-          origCode = null;
+        // If user passed destination_iata explicitly alongside GPS without a flight lookup, GPS is the origin
+        if (flightDestCode && !origCode && visitedCode && visitedCode !== flightDestCode) {
+          origCode = visitedCode;
         }
 
-        if (!destCode) {
+        if (!visitedCode) {
           return jsonResponse(
             {
               error:
@@ -4002,14 +3997,14 @@ export default {
           );
         }
 
-        // If origin_iata is still blank and auto_origin is enabled, infer origin from the user's most recent airport visit
+        // 3. If origin_iata is still blank and auto_origin is enabled, infer origin from the user's most recent airport visit
         if (!origCode && body.auto_origin === true && username) {
           try {
             const lastVisit = await db
               .prepare(
                 "SELECT iata_code FROM airport_visits WHERE username = ? AND iata_code != ? ORDER BY visit_date DESC, id DESC LIMIT 1"
               )
-              .bind(username, destCode)
+              .bind(username, visitedCode)
               .first();
             if (lastVisit && lastVisit.iata_code) {
               origCode = String(lastVisit.iata_code).trim().toUpperCase();
@@ -4019,12 +4014,25 @@ export default {
           }
         }
 
-        // Validate that iata_code (and origin_iata if given) exist in the airports reference table
-        const airportMap = await lookupAirportsMap(db, [destCode, origCode]);
-        const destAirport = airportMap.get(destCode);
-        if (!destAirport) {
+        if (!flightDestCode) {
+          flightDestCode = visitedCode;
+        }
+
+        // Prevent self-loop when no actual route exists
+        if (!origin_iata && !flightDestCode && origCode === visitedCode) {
+          origCode = null;
+        }
+
+        // Validate that visitedCode, origCode, and flightDestCode exist in the airports reference table
+        const airportMap = await lookupAirportsMap(db, [
+          visitedCode,
+          origCode,
+          flightDestCode,
+        ]);
+        const visitedAirport = airportMap.get(visitedCode);
+        if (!visitedAirport) {
           return jsonResponse(
-            { error: `Invalid or unknown iata_code '${destCode}'. It must match an airport in /api/airports.` },
+            { error: `Invalid or unknown iata_code '${visitedCode}'. It must match an airport in /api/airports.` },
             { status: 400 }
           );
         }
@@ -4037,9 +4045,18 @@ export default {
           );
         }
 
-        const resolvedName = airport_name || (destAirport ? destAirport.name : null);
+        const destAirport = flightDestCode
+          ? airportMap.get(flightDestCode) || visitedAirport
+          : visitedAirport;
+
+        const resolvedName =
+          airport_name || (visitedAirport ? visitedAirport.name : null);
+
+        // Calculate flight distance between origin_iata (e.g. LTN) and destination_iata (e.g. CLJ)
         const distanceKm =
-          origAirport && destAirport
+          origAirport &&
+          destAirport &&
+          origAirport.iata_code !== destAirport.iata_code
             ? calculateDistanceKm(
                 origAirport.latitude,
                 origAirport.longitude,
@@ -4048,8 +4065,36 @@ export default {
               )
             : null;
 
+        try {
+          await db
+            .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+            .run();
+        } catch {
+          // Column already exists
+        }
+
         let info;
         try {
+          info = await db
+            .prepare(
+              `INSERT INTO airport_visits
+                (iata_code, airport_name, visit_date, notes, username, origin_iata, destination_iata, flight_number, distance_km)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .bind(
+              visitedCode,
+              resolvedName,
+              resolvedVisitDate,
+              notes || null,
+              username,
+              origCode,
+              flightDestCode,
+              cleanFlightNumber,
+              distanceKm
+            )
+            .run();
+        } catch {
+          // Fallback if destination_iata column isn't available
           info = await db
             .prepare(
               `INSERT INTO airport_visits
@@ -4057,7 +4102,7 @@ export default {
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
             )
             .bind(
-              destCode,
+              visitedCode,
               resolvedName,
               resolvedVisitDate,
               notes || null,
@@ -4067,19 +4112,15 @@ export default {
               distanceKm
             )
             .run();
-        } catch {
-          // Fallback if 0003 migration columns aren't applied yet
-          info = await db
-            .prepare(
-              "INSERT INTO airport_visits (iata_code, airport_name, visit_date, notes, username) VALUES (?, ?, ?, ?, ?)"
-            )
-            .bind(destCode, resolvedName, resolvedVisitDate, notes || null, username)
-            .run();
         }
 
         ctx.waitUntil(invalidateVisitCaches(cache, url.origin, [username]));
 
-        const routeParts = [origCode ? `${origCode} → ${destCode}` : destCode];
+        const hasRoute = origCode && flightDestCode && origCode !== flightDestCode;
+        const routeLabel = hasRoute
+          ? `${origCode} → ${flightDestCode}`
+          : visitedCode;
+        const routeParts = [routeLabel];
         if (cleanFlightNumber) routeParts.push(cleanFlightNumber);
         if (distanceKm != null) routeParts.push(`${distanceKm} km`);
         const detailsBadge = routeParts.join(" · ");
@@ -4088,12 +4129,13 @@ export default {
           success: true,
           id: info.meta.last_row_id,
           username,
-          iata_code: destCode,
+          iata_code: visitedCode,
           origin_iata: origCode,
+          destination_iata: flightDestCode,
           flight_number: cleanFlightNumber,
           airport_name: resolvedName,
-          city: destAirport.city || null,
-          country: destAirport.country || null,
+          city: visitedAirport.city || null,
+          country: visitedAirport.country || null,
           visit_date: resolvedVisitDate,
           distance_km: distanceKm,
           detected_from_gps: detectedFromGps,
@@ -4243,16 +4285,49 @@ export default {
         const nextIata = body.iata_code
           ? String(body.iata_code).trim().toUpperCase()
           : existing.iata_code;
-        const nextOrigin =
+        let nextOrigin =
           body.origin_iata !== undefined
             ? body.origin_iata
               ? String(body.origin_iata).trim().toUpperCase()
               : null
             : existing.origin_iata;
+        let nextDestIata =
+          body.destination_iata !== undefined
+            ? body.destination_iata
+              ? String(body.destination_iata).trim().toUpperCase()
+              : null
+            : existing.destination_iata || null;
+        const nextFlightNumber =
+          body.flight_number !== undefined
+            ? body.flight_number
+              ? String(body.flight_number).trim().toUpperCase().replace(/\s+/g, "")
+              : null
+            : existing.flight_number;
 
-        const airportMap = await lookupAirportsMap(db, [nextIata, nextOrigin]);
-        const destAirport = airportMap.get(nextIata);
-        if (!destAirport) {
+        // If a flight_number is set and origin or destination is missing (or equal), resolve the flight route
+        if (nextFlightNumber && (!nextOrigin || !nextDestIata || nextOrigin === nextDestIata)) {
+          const resolvedRoute = await resolveFlightRoute(db, nextFlightNumber);
+          if (resolvedRoute) {
+            if (!nextOrigin || nextOrigin === nextDestIata) {
+              nextOrigin = resolvedRoute.origin_iata || nextOrigin;
+            }
+            if (!nextDestIata || nextOrigin === nextDestIata) {
+              nextDestIata = resolvedRoute.destination_iata || nextDestIata;
+            }
+          }
+        }
+
+        if (!nextDestIata) {
+          nextDestIata = nextIata;
+        }
+
+        const airportMap = await lookupAirportsMap(db, [
+          nextIata,
+          nextOrigin,
+          nextDestIata,
+        ]);
+        const visitedAirport = airportMap.get(nextIata);
+        if (!visitedAirport) {
           return jsonResponse(
             { error: `Invalid or unknown iata_code '${nextIata}'. It must match an airport in /api/airports.` },
             { status: 400 }
@@ -4267,14 +4342,20 @@ export default {
           );
         }
 
+        const destAirport = nextDestIata
+          ? airportMap.get(nextDestIata) || visitedAirport
+          : visitedAirport;
+
         let nextAirportName =
           body.airport_name !== undefined ? body.airport_name : existing.airport_name;
-        if (body.iata_code && body.airport_name === undefined && destAirport) {
-          nextAirportName = destAirport.name;
+        if (body.iata_code && body.airport_name === undefined && visitedAirport) {
+          nextAirportName = visitedAirport.name;
         }
 
         const nextDistanceKm =
-          origAirport && destAirport
+          origAirport &&
+          destAirport &&
+          origAirport.iata_code !== destAirport.iata_code
             ? calculateDistanceKm(
                 origAirport.latitude,
                 origAirport.longitude,
@@ -4289,34 +4370,71 @@ export default {
         const nextNotes = body.notes !== undefined ? body.notes : existing.notes;
         const nextUsername =
           user.username || (body.username !== undefined ? body.username : existing.username);
-        const nextFlightNumber =
-          body.flight_number !== undefined ? body.flight_number : existing.flight_number;
 
-        const info = await db
-          .prepare(
-            `UPDATE airport_visits
-             SET iata_code = ?,
-                 airport_name = ?,
-                 visit_date = ?,
-                 notes = ?,
-                 username = ?,
-                 origin_iata = ?,
-                 flight_number = ?,
-                 distance_km = ?
-             WHERE id = ?`
-          )
-          .bind(
-            nextIata,
-            nextAirportName,
-            nextVisitDate,
-            nextNotes,
-            nextUsername,
-            nextOrigin,
-            nextFlightNumber,
-            nextDistanceKm,
-            visitId
-          )
-          .run();
+        try {
+          await db
+            .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+            .run();
+        } catch {
+          // Column already exists
+        }
+
+        let info;
+        try {
+          info = await db
+            .prepare(
+              `UPDATE airport_visits
+               SET iata_code = ?,
+                   airport_name = ?,
+                   visit_date = ?,
+                   notes = ?,
+                   username = ?,
+                   origin_iata = ?,
+                   destination_iata = ?,
+                   flight_number = ?,
+                   distance_km = ?
+               WHERE id = ?`
+            )
+            .bind(
+              nextIata,
+              nextAirportName,
+              nextVisitDate,
+              nextNotes,
+              nextUsername,
+              nextOrigin,
+              nextDestIata,
+              nextFlightNumber,
+              nextDistanceKm,
+              visitId
+            )
+            .run();
+        } catch {
+          info = await db
+            .prepare(
+              `UPDATE airport_visits
+               SET iata_code = ?,
+                   airport_name = ?,
+                   visit_date = ?,
+                   notes = ?,
+                   username = ?,
+                   origin_iata = ?,
+                   flight_number = ?,
+                   distance_km = ?
+               WHERE id = ?`
+            )
+            .bind(
+              nextIata,
+              nextAirportName,
+              nextVisitDate,
+              nextNotes,
+              nextUsername,
+              nextOrigin,
+              nextFlightNumber,
+              nextDistanceKm,
+              visitId
+            )
+            .run();
+        }
 
         ctx.waitUntil(
           invalidateVisitCaches(cache, url.origin, [existing.username, nextUsername])

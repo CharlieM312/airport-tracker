@@ -64,6 +64,11 @@ function jsonResponse(data, init = {}) {
     ...CORS_HEADERS,
     ...(init.headers || {}),
   };
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    if (data.error && !data.message) {
+      data = { ...data, message: data.error };
+    }
+  }
   return Response.json(data, { ...init, headers });
 }
 
@@ -1228,6 +1233,267 @@ async function lookupAirportsMap(db, codes) {
     // Gracefully continue if airports reference table migration hasn't been applied yet
   }
   return map;
+}
+
+/**
+ * Find the closest airports in the `airports` reference table to a given GPS (latitude, longitude) point.
+ */
+async function findNearestAirports(db, lat, lon, limit = 5) {
+  const numLat = Number(lat);
+  const numLon = Number(lon);
+  if (!Number.isFinite(numLat) || !Number.isFinite(numLon)) {
+    return [];
+  }
+
+  // Coarse bounding-box filter (~3 degrees lat/lon around the point) with fallback to full table scan
+  const { results } = await db
+    .prepare(
+      "SELECT iata_code, name, city, country, latitude, longitude FROM airports WHERE latitude IS NOT NULL AND longitude IS NOT NULL"
+    )
+    .all();
+
+  const ranked = [];
+  for (const row of results || []) {
+    const distKm = calculateDistanceKm(numLat, numLon, row.latitude, row.longitude);
+    if (distKm != null) {
+      ranked.push({
+        ...row,
+        distance_from_location_km: distKm,
+        distance_from_location_miles: Math.round(distKm * KM_TO_MILES * 10) / 10,
+      });
+    }
+  }
+
+  ranked.sort((a, b) => a.distance_from_location_km - b.distance_from_location_km);
+  return ranked.slice(0, Math.max(1, Math.min(limit, 50)));
+}
+
+/**
+ * Common 2-letter IATA airline code -> 3-letter ICAO callsign prefix map
+ * so IATA flight numbers like `BA968`, `U28541`, or `FR1234` resolve cleanly against ADSBdb.
+ */
+const IATA_TO_ICAO_AIRLINES = {
+  BA: "BAW",
+  U2: "EZY",
+  EZ: "EZY",
+  FR: "RYR",
+  RK: "RUK",
+  VS: "VIR",
+  EI: "EIN",
+  LS: "EXS",
+  BY: "TOM",
+  MT: "TOM",
+  LM: "LOG",
+  SI: "BCI",
+  GR: "AUR",
+  T3: "EZE",
+  KL: "KLM",
+  LH: "DLH",
+  EW: "EWG",
+  AF: "AFR",
+  IB: "IBE",
+  VY: "VLG",
+  UX: "AEA",
+  AZ: "ITY",
+  LX: "SWR",
+  OS: "AUA",
+  SN: "BEL",
+  SK: "SAS",
+  AY: "FIN",
+  DY: "NOZ",
+  D8: "NSZ",
+  TP: "TAP",
+  A3: "AEE",
+  LO: "LOT",
+  BT: "BTI",
+  W6: "WZZ",
+  W9: "WUK",
+  W4: "WMT",
+  FI: "ICE",
+  TK: "THY",
+  PC: "PGT",
+  AA: "AAL",
+  DL: "DAL",
+  UA: "UAL",
+  WN: "SWA",
+  B6: "JBU",
+  AS: "ASA",
+  AC: "ACA",
+  WS: "WJA",
+  EK: "UAE",
+  QR: "QTR",
+  EY: "ETD",
+  SQ: "SIA",
+  CX: "CPA",
+  QF: "QFA",
+  NZ: "ANZ",
+  NH: "ANA",
+  JL: "JAL",
+};
+
+/**
+ * Resolve a flight number / callsign (e.g., `BA968` or `BAW968`) to its origin and destination IATA codes.
+ * 1. Queries the free public ADSBdb Callsign API (`https://api.adsbdb.com/v0/callsign/{CALLSIGN}`)
+ *    and automatically upserts any missing origin/destination airport into the D1 `airports` reference table.
+ * 2. Falls back to previously logged flights with the same `flight_number` in D1 `airport_visits`.
+ */
+async function resolveFlightRoute(db, rawFlightNumber) {
+  const cleaned = String(rawFlightNumber || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+  if (!cleaned) return null;
+
+  // Build candidate callsigns to try (e.g. BA968 -> ["BAW968", "BA968"], W43304 -> ["WMT3304", "WZZ3304", "WUK3304", "W43304"])
+  const candidates = [];
+  const match = cleaned.match(/^([A-Z]{3}|[A-Z0-9]{2})0*(\d+[A-Z]?)$/);
+  if (match) {
+    const [, prefix, numPart] = match;
+    const mappedIcao = IATA_TO_ICAO_AIRLINES[prefix];
+    if (mappedIcao) {
+      candidates.push(`${mappedIcao}${numPart}`);
+    }
+    // Multi-subsidiary European carriers (Wizz Air: WMT/WZZ/WUK, easyJet: EZY/EJU/EZS, Ryanair: RYR/RUK)
+    if (["W4", "W6", "W9", "WMT", "WZZ", "WUK"].includes(prefix)) {
+      for (const sub of ["WMT", "WZZ", "WUK"]) {
+        if (!candidates.includes(`${sub}${numPart}`)) candidates.push(`${sub}${numPart}`);
+      }
+    } else if (["U2", "EZ", "EZY", "EJU", "EZS"].includes(prefix)) {
+      for (const sub of ["EZY", "EJU", "EZS"]) {
+        if (!candidates.includes(`${sub}${numPart}`)) candidates.push(`${sub}${numPart}`);
+      }
+    } else if (["FR", "RK", "RYR", "RUK"].includes(prefix)) {
+      for (const sub of ["RYR", "RUK"]) {
+        if (!candidates.includes(`${sub}${numPart}`)) candidates.push(`${sub}${numPart}`);
+      }
+    }
+    if (!candidates.includes(`${prefix}${numPart}`)) {
+      candidates.push(`${prefix}${numPart}`);
+    }
+  }
+  if (!candidates.includes(cleaned)) {
+    candidates.push(cleaned);
+  }
+
+  for (const callsign of candidates) {
+    try {
+      const res = await fetch(
+        `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`,
+        {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "Airport-Tracker-Worker",
+          },
+        }
+      );
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      const route = data?.response?.flightroute;
+      if (!route) continue;
+
+      const orig = route.origin || null;
+      const dest = route.destination || null;
+      const origIata = orig?.iata_code
+        ? String(orig.iata_code).trim().toUpperCase()
+        : null;
+      const destIata = dest?.iata_code
+        ? String(dest.iata_code).trim().toUpperCase()
+        : null;
+
+      if (!origIata && !destIata) continue;
+
+      // Auto-upsert origin and destination airports into `airports` reference table so foreign keys & distances always work
+      for (const ap of [orig, dest]) {
+        if (
+          ap &&
+          ap.iata_code &&
+          ap.name &&
+          ap.latitude != null &&
+          ap.longitude != null
+        ) {
+          try {
+            await db
+              .prepare(
+                `INSERT INTO airports (iata_code, name, city, country, latitude, longitude)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(iata_code) DO NOTHING`
+              )
+              .bind(
+                String(ap.iata_code).trim().toUpperCase(),
+                ap.name,
+                ap.municipality || null,
+                ap.country_name || null,
+                Number(ap.latitude),
+                Number(ap.longitude)
+              )
+              .run();
+          } catch {
+            // Non-fatal if airports table is read-only or unavailable
+          }
+        }
+      }
+
+      return {
+        source: "adsbdb",
+        flight_number: cleaned,
+        callsign_icao: route.callsign_icao || callsign,
+        callsign_iata: route.callsign_iata || cleaned,
+        airline_name: route.airline?.name || null,
+        origin_iata: origIata,
+        origin_name: orig?.name || null,
+        origin_city: orig?.municipality || null,
+        origin_country: orig?.country_name || null,
+        destination_iata: destIata,
+        destination_name: dest?.name || null,
+        destination_city: dest?.municipality || null,
+        destination_country: dest?.country_name || null,
+        distance_km:
+          orig?.latitude != null && dest?.latitude != null
+            ? calculateDistanceKm(
+                orig.latitude,
+                orig.longitude,
+                dest.latitude,
+                dest.longitude
+              )
+            : null,
+      };
+    } catch {
+      // Try next candidate or fall back to local D1 history
+    }
+  }
+
+  // Fallback: check if this flight_number has ever been logged in `airport_visits`
+  try {
+    const previous = await db
+      .prepare(
+        `SELECT origin_iata, iata_code, distance_km
+         FROM airport_visits
+         WHERE UPPER(flight_number) = ? AND origin_iata IS NOT NULL
+         ORDER BY visit_date DESC, id DESC
+         LIMIT 1`
+      )
+      .bind(cleaned)
+      .first();
+
+    if (previous) {
+      return {
+        source: "history",
+        flight_number: cleaned,
+        origin_iata: previous.origin_iata
+          ? String(previous.origin_iata).trim().toUpperCase()
+          : null,
+        destination_iata: previous.iata_code
+          ? String(previous.iata_code).trim().toUpperCase()
+          : null,
+        distance_km: previous.distance_km ?? null,
+      };
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  return null;
 }
 
 export default {
@@ -3455,7 +3721,47 @@ export default {
     }
 
     // =========================================================================
-    // GET /api/airports - Reference table lookup (?code=LHR or ?search=London)
+    // GET /api/flights - Lookup origin & destination IATA by flight number (?flight_number=BA968)
+    // =========================================================================
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/api/flights" || url.pathname.startsWith("/api/flights/"))
+    ) {
+      try {
+        const pathFlight = url.pathname.startsWith("/api/flights/")
+          ? decodeURIComponent(url.pathname.slice("/api/flights/".length))
+          : null;
+        const flightNumber =
+          pathFlight ||
+          url.searchParams.get("flight_number") ||
+          url.searchParams.get("flight") ||
+          url.searchParams.get("callsign");
+
+        if (!flightNumber) {
+          return jsonResponse(
+            { error: "Provide a flight_number query parameter (e.g. ?flight_number=BA968)" },
+            { status: 400 }
+          );
+        }
+
+        const route = await resolveFlightRoute(db, flightNumber);
+        if (!route) {
+          return jsonResponse(
+            {
+              error: `Could not resolve route for flight '${String(flightNumber).toUpperCase()}'`,
+            },
+            { status: 404 }
+          );
+        }
+
+        return jsonResponse(route);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
+    // GET /api/airports - Reference table lookup (?code=LHR, ?search=London, or ?lat=51.47&lon=-0.45)
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/airports") {
       try {
@@ -3464,6 +3770,26 @@ export default {
 
         const code = url.searchParams.get("code");
         const search = url.searchParams.get("search");
+        const latParam =
+          url.searchParams.get("lat") ?? url.searchParams.get("latitude");
+        const lonParam =
+          url.searchParams.get("lon") ??
+          url.searchParams.get("lng") ??
+          url.searchParams.get("longitude");
+
+        if (latParam != null && lonParam != null && latParam !== "" && lonParam !== "") {
+          const limitParam = parseInt(url.searchParams.get("limit") || "5", 10) || 5;
+          const maxKmParam = url.searchParams.get("max_km")
+            ? Number(url.searchParams.get("max_km"))
+            : null;
+          let nearest = await findNearestAirports(db, latParam, lonParam, limitParam);
+          if (maxKmParam != null && Number.isFinite(maxKmParam)) {
+            nearest = nearest.filter((a) => a.distance_from_location_km <= maxKmParam);
+          }
+          const response = Response.json(nearest, { headers: cacheHeaders() });
+          ctx.waitUntil(cache.put(request, response.clone()));
+          return response;
+        }
 
         let query = "SELECT iata_code, name, city, country, latitude, longitude FROM airports";
         const params = [];
@@ -3554,19 +3880,144 @@ export default {
       try {
         const body = await request.json();
         const { iata_code, airport_name, visit_date, notes, origin_iata, flight_number } = body;
+        const rawLat = body.latitude ?? body.lat ?? null;
+        const rawLon = body.longitude ?? body.lon ?? body.lng ?? null;
+        const gpsLat =
+          rawLat != null && rawLat !== ""
+            ? Number(String(rawLat).trim().replace(",", "."))
+            : null;
+        const gpsLon =
+          rawLon != null && rawLon !== ""
+            ? Number(String(rawLon).trim().replace(",", "."))
+            : null;
+        const hasGps =
+          gpsLat != null &&
+          gpsLon != null &&
+          Number.isFinite(gpsLat) &&
+          Number.isFinite(gpsLon);
 
         // Automatically use the authenticated user's username (fallback to body.username for API_SECRET)
         const username = user.username || body.username || null;
 
-        if (!iata_code || !visit_date) {
+        // Default visit_date to today's ISO date (`YYYY-MM-DD`) whenever omitted or empty
+        const resolvedVisitDate =
+          (visit_date && String(visit_date).trim()) ||
+          new Date().toISOString().slice(0, 10);
+
+        let destCode = iata_code ? String(iata_code).trim().toUpperCase() : "";
+        const explicitDestCode = body.destination_iata
+          ? String(body.destination_iata).trim().toUpperCase()
+          : "";
+        let gpsDetectedCode = "";
+        let detectedFromGps = false;
+        let gpsDistanceKm = null;
+
+        // If GPS coordinates are provided and either iata_code is omitted OR destination_iata is given (departure-gate mode)
+        if (hasGps && (!destCode || explicitDestCode)) {
+          const maxRadiusKm =
+            body.max_distance_km != null && Number.isFinite(Number(body.max_distance_km))
+              ? Number(body.max_distance_km)
+              : 35;
+          const nearestList = await findNearestAirports(db, gpsLat, gpsLon, 1);
+          const closest = nearestList[0];
+
+          if (!closest) {
+            return jsonResponse(
+              { error: "No airports found in reference database for GPS lookup" },
+              { status: 400 }
+            );
+          }
+
+          if (closest.distance_from_location_km > maxRadiusKm) {
+            return jsonResponse(
+              {
+                error: `No airport found within ${maxRadiusKm} km of your GPS coordinates. Closest airport is ${closest.name} (${closest.iata_code}) at ${closest.distance_from_location_km} km away.`,
+                closest_airport: closest,
+              },
+              { status: 400 }
+            );
+          }
+
+          gpsDetectedCode = closest.iata_code.toUpperCase();
+          detectedFromGps = true;
+          gpsDistanceKm = closest.distance_from_location_km;
+
+          if (!destCode && !explicitDestCode) {
+            destCode = gpsDetectedCode;
+          }
+        }
+
+        const cleanFlightNumber =
+          flight_number && String(flight_number).trim()
+            ? String(flight_number).trim().toUpperCase().replace(/\s+/g, "")
+            : null;
+
+        let origCode =
+          origin_iata && String(origin_iata).trim()
+            ? String(origin_iata).trim().toUpperCase()
+            : null;
+
+        // Departure-gate mode: if the user passed `destination_iata` alongside GPS, GPS is their Origin airport!
+        if (explicitDestCode) {
+          if (!origCode && gpsDetectedCode) {
+            origCode = gpsDetectedCode;
+          }
+          destCode = explicitDestCode;
+        }
+
+        // If a flight_number was provided and either origin_iata or explicit iata_code is missing, look up the flight route automatically!
+        const hasExplicitIata = Boolean(
+          (iata_code && String(iata_code).trim()) || explicitDestCode
+        );
+        let resolvedRoute = null;
+        if (cleanFlightNumber && (!origCode || !hasExplicitIata)) {
+          resolvedRoute = await resolveFlightRoute(db, cleanFlightNumber);
+          if (resolvedRoute) {
+            if (!origCode && resolvedRoute.origin_iata) {
+              origCode = resolvedRoute.origin_iata;
+            }
+            // If destCode was not explicitly typed (or GPS detected the departure airport, e.g. LTN for W43304 LTN->CLJ),
+            // use the flight's actual destination airport so we never log LTN -> LTN (0 km)!
+            if (
+              resolvedRoute.destination_iata &&
+              (!hasExplicitIata || destCode === origCode)
+            ) {
+              destCode = resolvedRoute.destination_iata;
+            }
+          }
+        }
+
+        // Prevent auto-detected origin from equaling destination (0 km self-loop)
+        if (!origin_iata && origCode && destCode && origCode === destCode) {
+          origCode = null;
+        }
+
+        if (!destCode) {
           return jsonResponse(
-            { error: "Missing required fields: iata_code and visit_date" },
+            {
+              error:
+                "Missing required fields: provide iata_code, flight_number, or latitude and longitude for GPS check-in",
+            },
             { status: 400 }
           );
         }
 
-        const destCode = String(iata_code).trim().toUpperCase();
-        const origCode = origin_iata ? String(origin_iata).trim().toUpperCase() : null;
+        // If origin_iata is still blank and auto_origin is enabled, infer origin from the user's most recent airport visit
+        if (!origCode && body.auto_origin === true && username) {
+          try {
+            const lastVisit = await db
+              .prepare(
+                "SELECT iata_code FROM airport_visits WHERE username = ? AND iata_code != ? ORDER BY visit_date DESC, id DESC LIMIT 1"
+              )
+              .bind(username, destCode)
+              .first();
+            if (lastVisit && lastVisit.iata_code) {
+              origCode = String(lastVisit.iata_code).trim().toUpperCase();
+            }
+          } catch {
+            // Non-fatal if previous visit lookup fails
+          }
+        }
 
         // Validate that iata_code (and origin_iata if given) exist in the airports reference table
         const airportMap = await lookupAirportsMap(db, [destCode, origCode]);
@@ -3608,11 +4059,11 @@ export default {
             .bind(
               destCode,
               resolvedName,
-              visit_date,
+              resolvedVisitDate,
               notes || null,
               username,
               origCode,
-              flight_number || null,
+              cleanFlightNumber,
               distanceKm
             )
             .run();
@@ -3622,19 +4073,35 @@ export default {
             .prepare(
               "INSERT INTO airport_visits (iata_code, airport_name, visit_date, notes, username) VALUES (?, ?, ?, ?, ?)"
             )
-            .bind(destCode, resolvedName, visit_date, notes || null, username)
+            .bind(destCode, resolvedName, resolvedVisitDate, notes || null, username)
             .run();
         }
 
         ctx.waitUntil(invalidateVisitCaches(cache, url.origin, [username]));
 
+        const routeParts = [origCode ? `${origCode} → ${destCode}` : destCode];
+        if (cleanFlightNumber) routeParts.push(cleanFlightNumber);
+        if (distanceKm != null) routeParts.push(`${distanceKm} km`);
+        const detailsBadge = routeParts.join(" · ");
+
         return jsonResponse({
           success: true,
           id: info.meta.last_row_id,
           username,
+          iata_code: destCode,
+          origin_iata: origCode,
+          flight_number: cleanFlightNumber,
           airport_name: resolvedName,
+          city: destAirport.city || null,
+          country: destAirport.country || null,
+          visit_date: resolvedVisitDate,
           distance_km: distanceKm,
+          detected_from_gps: detectedFromGps,
+          gps_distance_km: gpsDistanceKm,
           changes: info.meta.changes,
+          message: detectedFromGps
+            ? `Checked in at ${resolvedName} (${detailsBadge}) — ${gpsDistanceKm} km away! ✈️`
+            : `Checked in at ${resolvedName} (${detailsBadge})! ✈️`,
         });
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });

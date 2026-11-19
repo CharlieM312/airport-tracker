@@ -344,18 +344,19 @@ Executes 5 analytical queries in a single D1 `db.batch()` round-trip to return t
 ---
 
 ### 6. `GET /api/airports`
-Look up or search airports in the `airports` reference table.
+Look up, search, or find the nearest airports by GPS coordinates in the `airports` reference table.
 
 **Query Parameters:**
 - `code` *(optional)*: Exact 3-letter IATA code lookup (e.g., `?code=LHR`).
 - `search` *(optional)*: Case-insensitive substring search across `iata_code`, `name`, `city`, and `country` (e.g., `?search=London`).
+- `lat` & `lon` *(optional, or `latitude` & `longitude`)*: Returns the closest airports ranked by Haversine distance (`distance_from_location_km` & `distance_from_location_miles`). Supports optional `limit` (default `5`) and `max_km` radius filter.
 
 ---
 
 ## Protected Write Endpoints
 
 ### 7. `POST /api/visits`
-Log a new airport visit. Validates the session token in `Authorization: Bearer <token>`, sets `username` from the authenticated user, validates `iata_code` (and `origin_iata`, if provided) against `airports`, auto-populates `airport_name` if omitted, and auto-computes Haversine `distance_km`.
+Log a new airport visit. Validates the session token or `atk_...` API key in `Authorization: Bearer <token>`, sets `username` from the authenticated user, validates `iata_code` (or **auto-detects the nearest airport within 35 km** when `latitude` and `longitude` are passed instead of `iata_code`), defaults `visit_date` to today (`YYYY-MM-DD`) when using GPS coordinates, auto-populates `airport_name` if omitted, and auto-computes Haversine `distance_km`.
 
 **Request Body:**
 ```json

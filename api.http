@@ -129,6 +129,12 @@ GET {{baseUrl}}/api/airports?search=London
 ### Lookup Single Reference Airport by IATA Code
 GET {{baseUrl}}/api/airports?code=LHR
 
+### Find Nearest Airports by GPS Coordinates (Latitude / Longitude)
+GET {{baseUrl}}/api/airports?lat=51.4700&lon=-0.4543&limit=3
+
+### Lookup Flight Route (Origin & Destination IATA) by Flight Number / Callsign
+GET {{baseUrl}}/api/flights?flight_number=BA968
+
 
 # =============================================================================
 # 5. PROTECTED WRITE ENDPOINTS (Log, Edit & Delete Visits using `@token`)
@@ -145,6 +151,18 @@ Content-Type: application/json
   "visit_date": "2026-11-18",
   "flight_number": "BA968",
   "notes": "Logged from VS Code REST Client"
+}
+
+### One-Tap GPS Check-In + Flight Number (Auto-detects destination from GPS & origin from flight_number!)
+POST {{baseUrl}}/api/visits
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "latitude": 53.6304,
+  "longitude": 9.9882,
+  "flight_number": "BA968",
+  "notes": "Checked in via iPhone GPS"
 }
 
 ### Batch Log Multiple Visits in an Atomic D1 Transaction

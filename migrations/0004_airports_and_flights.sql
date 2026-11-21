@@ -158,7 +158,7 @@ CREATE TABLE airport_visits_new (
   iata_code TEXT NOT NULL REFERENCES airports(iata_code) ON UPDATE CASCADE,
   airport_name TEXT,
   visit_date TEXT NOT NULL,
-  username TEXT NOT NULL,
+  username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
   notes TEXT,
   origin_iata TEXT REFERENCES airports(iata_code) ON UPDATE CASCADE,
   flight_number TEXT,

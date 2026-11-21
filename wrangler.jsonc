@@ -16,6 +16,20 @@
 			"enabled": false
 		}
 	},
+	"previews": {
+		"vars": {
+			"GITHUB_CLIENT_ID": "Ov23li6QFlqXfQQIVmy9",
+			"GOOGLE_CLIENT_ID": "1032843537938-k3gfcmfvrp0fgigpc2kss4psrjiepki7.apps.googleusercontent.com",
+			"MICROSOFT_CLIENT_ID": "d8009171-216d-45d7-8b91-de11a2d23f26"
+		},
+		"d1_databases": [
+			{
+				"binding": "DB",
+				"database_name": "airport-db",
+				"database_id": "5053fd79-d967-4875-a9bf-9aff4b3549b5"
+			}
+		]
+	},
 	"vars": {
 		"GITHUB_CLIENT_ID": "Ov23li6QFlqXfQQIVmy9",
 		"GOOGLE_CLIENT_ID": "1032843537938-k3gfcmfvrp0fgigpc2kss4psrjiepki7.apps.googleusercontent.com",

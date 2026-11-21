@@ -31,3 +31,6 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
 
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_username ON user_api_keys (username);
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_hash ON user_api_keys (key_hash);
+
+-- 4. Add destination_iata to airport_visits so GPS check-ins can record both origin and destination alongside the visited airport
+ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT REFERENCES airports(iata_code) ON UPDATE CASCADE;

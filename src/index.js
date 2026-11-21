@@ -1651,7 +1651,8 @@ export default {
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/register") {
       try {
-        const { username, password, email } = await request.json();
+        const body = await request.json();
+        const { username, password, email, recaptcha_token } = body;
         const cleanUsername = String(username || "").trim();
 
         if (!cleanUsername || !password) {
@@ -1666,6 +1667,94 @@ export default {
             { error: "Password must be at least 8 characters long" },
             { status: 400 }
           );
+        }
+
+        // Verify reCAPTCHA Enterprise (or v3 fallback) token when RECAPTCHA_API_KEY or RECAPTCHA_SECRET_KEY is configured
+        if (env.RECAPTCHA_API_KEY) {
+          if (!recaptcha_token) {
+            return jsonResponse(
+              { error: "reCAPTCHA verification token is required" },
+              { status: 400 }
+            );
+          }
+
+          const siteKey =
+            env.RECAPTCHA_SITE_KEY ||
+            "6LcFGiwuAAAAAFMGjXiXaqEi1TTODLbSAXiqYBRI";
+          const assessmentRes = await fetch(
+            "https://recaptchaenterprise.googleapis.com/v1/projects/charliem312-website/assessments",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": env.RECAPTCHA_API_KEY,
+              },
+              body: JSON.stringify({
+                event: {
+                  token: String(recaptcha_token),
+                  expectedAction: "REGISTER",
+                  siteKey,
+                },
+              }),
+            }
+          );
+
+          const assessmentData = await assessmentRes.json();
+          const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
+          const tokenProps = assessmentData?.tokenProperties;
+          const score = assessmentData?.riskAnalysis?.score;
+          const actionMatches =
+            !tokenProps?.action ||
+            String(tokenProps.action).toUpperCase() === "REGISTER";
+
+          if (
+            !assessmentRes.ok ||
+            !tokenProps?.valid ||
+            !actionMatches ||
+            (typeof score === "number" && score < minScore)
+          ) {
+            return jsonResponse(
+              {
+                error: "reCAPTCHA Enterprise verification failed. Automated request blocked.",
+                invalid_reason: tokenProps?.invalidReason || null,
+              },
+              { status: 403 }
+            );
+          }
+        } else if (env.RECAPTCHA_SECRET_KEY) {
+          if (!recaptcha_token) {
+            return jsonResponse(
+              { error: "reCAPTCHA verification token is required" },
+              { status: 400 }
+            );
+          }
+          const verifyForm = new URLSearchParams({
+            secret: env.RECAPTCHA_SECRET_KEY,
+            response: String(recaptcha_token),
+          });
+          const clientIp = request.headers.get("CF-Connecting-IP");
+          if (clientIp) {
+            verifyForm.set("remoteip", clientIp);
+          }
+          const verifyRes = await fetch(
+            "https://www.google.com/recaptcha/api/siteverify",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: verifyForm.toString(),
+            }
+          );
+          const verifyData = await verifyRes.json();
+          const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
+          if (
+            !verifyData.success ||
+            (typeof verifyData.score === "number" && verifyData.score < minScore)
+          ) {
+            return jsonResponse(
+              { error: "reCAPTCHA verification failed. Automated request blocked." },
+              { status: 403 }
+            );
+          }
         }
 
         await ensureOAuthTables(db);

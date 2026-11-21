@@ -1496,6 +1496,140 @@ async function resolveFlightRoute(db, rawFlightNumber) {
   return null;
 }
 
+/**
+ * Verify a reCAPTCHA Enterprise (or v3 siteverify) token and return { ok, score, action, errorResponse }.
+ */
+async function verifyRecaptchaToken(
+  request,
+  env,
+  recaptchaToken,
+  expectedActions = ["signup", "register", "login", "password_reset"]
+) {
+  const apiKey =
+    env.RECAPTCHA_API_KEY ||
+    (env.RECAPTCHA_SECRET_KEY &&
+    String(env.RECAPTCHA_SECRET_KEY).startsWith("AIza")
+      ? env.RECAPTCHA_SECRET_KEY
+      : null);
+  const legacySecret =
+    !apiKey && env.RECAPTCHA_SECRET_KEY ? env.RECAPTCHA_SECRET_KEY : null;
+
+  if (!apiKey && !legacySecret) {
+    return { ok: true, skipped: true };
+  }
+
+  if (!recaptchaToken) {
+    return {
+      ok: false,
+      errorResponse: jsonResponse(
+        { error: "reCAPTCHA verification token is required" },
+        { status: 400 }
+      ),
+    };
+  }
+
+  const normalizedAllowed = expectedActions.map((a) =>
+    String(a).toLowerCase()
+  );
+  const primaryExpectedAction = normalizedAllowed[0] || "login";
+  const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
+
+  if (apiKey) {
+    const siteKey =
+      env.RECAPTCHA_SITE_KEY || "6LcFGiwuAAAAAFMGjXiXaqEilTTODLbSAXiqYBRI";
+    const projectId = env.RECAPTCHA_PROJECT_ID || "charliem312-website";
+    const assessmentRes = await fetch(
+      `https://recaptchaenterprise.googleapis.com/v1/projects/${projectId}/assessments?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          event: {
+            token: String(recaptchaToken),
+            expectedAction: primaryExpectedAction,
+            siteKey,
+          },
+        }),
+      }
+    );
+
+    const assessmentData = await assessmentRes.json();
+    const tokenProps = assessmentData?.tokenProperties;
+    const score = assessmentData?.riskAnalysis?.score;
+    const returnedAction = tokenProps?.action
+      ? String(tokenProps.action).toLowerCase()
+      : "";
+    const actionMatches =
+      !returnedAction || normalizedAllowed.includes(returnedAction);
+
+    if (
+      !assessmentRes.ok ||
+      !tokenProps?.valid ||
+      !actionMatches ||
+      (typeof score === "number" && score < minScore)
+    ) {
+      return {
+        ok: false,
+        score: score ?? null,
+        action: returnedAction || null,
+        errorResponse: jsonResponse(
+          {
+            error:
+              "reCAPTCHA Enterprise verification failed. Automated request blocked.",
+            invalid_reason: tokenProps?.invalidReason || null,
+          },
+          { status: 403 }
+        ),
+      };
+    }
+
+    return {
+      ok: true,
+      score: score ?? null,
+      action: returnedAction || primaryExpectedAction,
+    };
+  }
+
+  const verifyForm = new URLSearchParams({
+    secret: legacySecret,
+    response: String(recaptchaToken),
+  });
+  const clientIp = request.headers.get("CF-Connecting-IP");
+  if (clientIp) {
+    verifyForm.set("remoteip", clientIp);
+  }
+  const verifyRes = await fetch(
+    "https://www.google.com/recaptcha/api/siteverify",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: verifyForm.toString(),
+    }
+  );
+  const verifyData = await verifyRes.json();
+  if (
+    !verifyData.success ||
+    (typeof verifyData.score === "number" && verifyData.score < minScore)
+  ) {
+    return {
+      ok: false,
+      score: verifyData.score ?? null,
+      errorResponse: jsonResponse(
+        { error: "reCAPTCHA verification failed. Automated request blocked." },
+        { status: 403 }
+      ),
+    };
+  }
+
+  return {
+    ok: true,
+    score: verifyData.score ?? null,
+    action: verifyData.action || primaryExpectedAction,
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     // Handle CORS preflight requests
@@ -1519,18 +1653,58 @@ export default {
     });
 
     // =========================================================================
+    // POST /api/recaptcha/assess - Verify a reCAPTCHA Enterprise token & request score
+    // =========================================================================
+    if (request.method === "POST" && url.pathname === "/api/recaptcha/assess") {
+      try {
+        const body = await request.json();
+        const token = body.recaptcha_token || body.token || "";
+        const action = body.action ? String(body.action).toLowerCase() : "login";
+        const result = await verifyRecaptchaToken(request, env, token, [
+          action,
+          "login",
+          "signup",
+          "register",
+          "password_reset",
+        ]);
+        if (!result.ok && result.errorResponse) {
+          return result.errorResponse;
+        }
+        return jsonResponse({
+          success: true,
+          score: result.score ?? null,
+          action: result.action || action,
+        });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, { status: 500 });
+      }
+    }
+
+    // =========================================================================
     // POST /api/login - Validate credentials (+ optional TOTP) & issue session token
     // =========================================================================
     if (request.method === "POST" && url.pathname === "/api/login") {
       try {
         const body = await request.json();
-        const { username, password, totp_code } = body;
+        const { username, password, totp_code, recaptcha_token } = body;
 
         if (!username || !password) {
           return jsonResponse(
             { error: "Username and password are required" },
             { status: 400 }
           );
+        }
+
+        if (recaptcha_token) {
+          const recaptchaCheck = await verifyRecaptchaToken(
+            request,
+            env,
+            recaptcha_token,
+            ["login"]
+          );
+          if (!recaptchaCheck.ok && recaptchaCheck.errorResponse) {
+            return recaptchaCheck.errorResponse;
+          }
         }
 
         await ensureSecurityTables(db);
@@ -1670,95 +1844,14 @@ export default {
         }
 
         // Verify reCAPTCHA Enterprise (or v3 fallback) token when RECAPTCHA_API_KEY or RECAPTCHA_SECRET_KEY is configured
-        if (env.RECAPTCHA_API_KEY) {
-          if (!recaptcha_token) {
-            return jsonResponse(
-              { error: "reCAPTCHA verification token is required" },
-              { status: 400 }
-            );
-          }
-
-          const siteKey =
-            env.RECAPTCHA_SITE_KEY ||
-            "6LcFGiwuAAAAAFMGjXiXaqEi1TTODLbSAXiqYBRI";
-          const assessmentRes = await fetch(
-            "https://recaptchaenterprise.googleapis.com/v1/projects/charliem312-website/assessments",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Goog-Api-Key": env.RECAPTCHA_API_KEY,
-              },
-              body: JSON.stringify({
-                event: {
-                  token: String(recaptcha_token),
-                  expectedAction: "signup",
-                  siteKey,
-                },
-              }),
-            }
-          );
-
-          const assessmentData = await assessmentRes.json();
-          const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
-          const tokenProps = assessmentData?.tokenProperties;
-          const score = assessmentData?.riskAnalysis?.score;
-          const returnedAction = tokenProps?.action
-            ? String(tokenProps.action).toLowerCase()
-            : "";
-          const actionMatches =
-            !returnedAction ||
-            returnedAction === "signup" ||
-            returnedAction === "register";
-
-          if (
-            !assessmentRes.ok ||
-            !tokenProps?.valid ||
-            !actionMatches ||
-            (typeof score === "number" && score < minScore)
-          ) {
-            return jsonResponse(
-              {
-                error: "reCAPTCHA Enterprise verification failed. Automated request blocked.",
-                invalid_reason: tokenProps?.invalidReason || null,
-              },
-              { status: 403 }
-            );
-          }
-        } else if (env.RECAPTCHA_SECRET_KEY) {
-          if (!recaptcha_token) {
-            return jsonResponse(
-              { error: "reCAPTCHA verification token is required" },
-              { status: 400 }
-            );
-          }
-          const verifyForm = new URLSearchParams({
-            secret: env.RECAPTCHA_SECRET_KEY,
-            response: String(recaptcha_token),
-          });
-          const clientIp = request.headers.get("CF-Connecting-IP");
-          if (clientIp) {
-            verifyForm.set("remoteip", clientIp);
-          }
-          const verifyRes = await fetch(
-            "https://www.google.com/recaptcha/api/siteverify",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: verifyForm.toString(),
-            }
-          );
-          const verifyData = await verifyRes.json();
-          const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
-          if (
-            !verifyData.success ||
-            (typeof verifyData.score === "number" && verifyData.score < minScore)
-          ) {
-            return jsonResponse(
-              { error: "reCAPTCHA verification failed. Automated request blocked." },
-              { status: 403 }
-            );
-          }
+        const recaptchaCheck = await verifyRecaptchaToken(
+          request,
+          env,
+          recaptcha_token,
+          ["signup", "register"]
+        );
+        if (!recaptchaCheck.ok && recaptchaCheck.errorResponse) {
+          return recaptchaCheck.errorResponse;
         }
 
         await ensureOAuthTables(db);

@@ -1692,7 +1692,7 @@ export default {
               body: JSON.stringify({
                 event: {
                   token: String(recaptcha_token),
-                  expectedAction: "REGISTER",
+                  expectedAction: "signup",
                   siteKey,
                 },
               }),
@@ -1703,9 +1703,13 @@ export default {
           const minScore = Number(env.RECAPTCHA_MIN_SCORE || 0.5);
           const tokenProps = assessmentData?.tokenProperties;
           const score = assessmentData?.riskAnalysis?.score;
+          const returnedAction = tokenProps?.action
+            ? String(tokenProps.action).toLowerCase()
+            : "";
           const actionMatches =
-            !tokenProps?.action ||
-            String(tokenProps.action).toUpperCase() === "REGISTER";
+            !returnedAction ||
+            returnedAction === "signup" ||
+            returnedAction === "register";
 
           if (
             !assessmentRes.ok ||

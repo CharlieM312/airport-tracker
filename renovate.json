@@ -1,6 +1,21 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
-  ]
+    "config:recommended",
+    "group:recommended",
+    ":prHourlyLimit2",
+    ":semanticCommitTypeAll(build)",
+    "security:minimumReleaseAgeNpm",
+    "workarounds:all"
+  ],
+  "minimumReleaseAge": "3 days",
+  "prCreation": "not-pending",
+  "prConcurrentLimit": 2,
+  "dependencyDashboard": {
+    "enabled": false
+  },
+  "configMigration": true,
+  "postUpdateOptions": ["yarnDedupeHighest"],
+  "internalChecksFilter": "strict",
+  "rangeStrategy": "bump"
 }

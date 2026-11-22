@@ -298,37 +298,43 @@ function getRpId(request, url) {
 
 /**
  * Ensure the `user_passkeys` table exists and return all registered passkeys for a username.
+ * Uses an optimistic SELECT first so normal requests avoid redundant DDL round-trips.
  */
 async function getUserPasskeys(db, username) {
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS user_passkeys (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
-        credential_id TEXT NOT NULL UNIQUE,
-        public_key TEXT NOT NULL,
-        label TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )`
-    )
-    .run();
-
-  const { results } = await db
-    .prepare(
-      "SELECT id, credential_id, public_key, label, created_at FROM user_passkeys WHERE username = ? ORDER BY id ASC"
-    )
-    .bind(username)
-    .all();
-
-  return results || [];
+  try {
+    const { results } = await db
+      .prepare(
+        "SELECT id, credential_id, public_key, label, created_at FROM user_passkeys WHERE username = ? ORDER BY id ASC"
+      )
+      .bind(username)
+      .all();
+    return results || [];
+  } catch {
+    await db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS user_passkeys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+          credential_id TEXT NOT NULL UNIQUE,
+          public_key TEXT NOT NULL,
+          label TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`
+      )
+      .run();
+    return [];
+  }
 }
 
 const SUPPORTED_OAUTH_PROVIDERS = ["github", "google", "microsoft", "apple"];
+let oauthTablesVerified = false;
+let securityTablesVerified = false;
 
 /**
- * Ensure `user_oauth_accounts` and `oauth_states` tables exist.
+ * Ensure `user_oauth_accounts` and `oauth_states` tables exist (runs at most once per Worker isolate).
  */
-async function ensureOAuthTables(db) {
+async function ensureOAuthTables(db, force = false) {
+  if (oauthTablesVerified && !force) return;
   try {
     await db
       .prepare("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
@@ -349,8 +355,8 @@ async function ensureOAuthTables(db) {
     // Column already exists
   }
 
-  await db
-    .prepare(
+  await db.batch([
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS user_oauth_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -361,11 +367,8 @@ async function ensureOAuthTables(db) {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(provider, provider_user_id)
       )`
-    )
-    .run();
-
-  await db
-    .prepare(
+    ),
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS oauth_states (
         state TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
@@ -373,15 +376,17 @@ async function ensureOAuthTables(db) {
         link_username TEXT,
         created_at INTEGER NOT NULL
       )`
-    )
-    .run();
+    ),
+  ]);
+  oauthTablesVerified = true;
 }
 
 /**
  * Ensure security hardening columns (`failed_login_attempts`, `locked_until`) and tables
- * (`user_sessions`, `user_api_keys`) exist.
+ * (`user_sessions`, `user_api_keys`) exist (runs at most once per Worker isolate).
  */
-async function ensureSecurityTables(db) {
+async function ensureSecurityTables(db, force = false) {
+  if (securityTablesVerified && !force) return;
   try {
     await db
       .prepare(
@@ -399,8 +404,8 @@ async function ensureSecurityTables(db) {
     // Column already exists
   }
 
-  await db
-    .prepare(
+  await db.batch([
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS user_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -411,11 +416,8 @@ async function ensureSecurityTables(db) {
         last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         expires_at INTEGER NOT NULL
       )`
-    )
-    .run();
-
-  await db
-    .prepare(
+    ),
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS user_api_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -426,8 +428,8 @@ async function ensureSecurityTables(db) {
         last_used_at DATETIME,
         expires_at INTEGER
       )`
-    )
-    .run();
+    ),
+  ]);
 
   // Auto-migrate any existing plain-text passwords in `users` to PBKDF2-SHA256
   try {
@@ -446,6 +448,7 @@ async function ensureSecurityTables(db) {
           .run();
       }
     }
+    securityTablesVerified = true;
   } catch {
     // Non-fatal if users table is not initialized yet
   }
@@ -525,10 +528,10 @@ async function clearFailedLoginAttempts(db, username) {
 }
 
 /**
- * Create a new multi-device session row in `user_sessions` (and update `users.session_token` for compatibility).
+ * Create a new multi-device session row in `user_sessions` (and update `users.session_token` for compatibility)
+ * in a single atomic D1 `db.batch()` round-trip.
  */
 async function createUserSession(db, request, username) {
-  await ensureSecurityTables(db);
   const sessionToken = crypto.randomUUID();
   const nowMs = Date.now();
   const expiresAt = nowMs + SESSION_TTL_MS;
@@ -539,40 +542,47 @@ async function createUserSession(db, request, username) {
     request.headers.get("X-Forwarded-For") ||
     null;
 
-  // Prune any expired sessions for cleanliness
-  await db
-    .prepare("DELETE FROM user_sessions WHERE expires_at < ?")
-    .bind(nowMs)
-    .run();
+  const runBatch = () =>
+    db.batch([
+      db.prepare("DELETE FROM user_sessions WHERE expires_at < ?").bind(nowMs),
+      db
+        .prepare(
+          `INSERT INTO user_sessions (username, token, user_agent, ip_address, expires_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .bind(username, sessionToken, userAgent, ipAddress, expiresAt),
+      db
+        .prepare("UPDATE users SET session_token = ? WHERE username = ?")
+        .bind(sessionToken, username),
+    ]);
 
-  await db
-    .prepare(
-      `INSERT INTO user_sessions (username, token, user_agent, ip_address, expires_at)
-       VALUES (?, ?, ?, ?, ?)`
-    )
-    .bind(username, sessionToken, userAgent, ipAddress, expiresAt)
-    .run();
-
-  await db
-    .prepare("UPDATE users SET session_token = ? WHERE username = ?")
-    .bind(sessionToken, username)
-    .run();
+  try {
+    await runBatch();
+  } catch {
+    await ensureSecurityTables(db, true);
+    await runBatch();
+  }
 
   return { token: sessionToken, expires_at: expiresAt };
 }
 
 /**
  * Return all linked OAuth accounts for a username.
+ * Uses an optimistic SELECT first to avoid redundant DDL queries.
  */
 async function getUserOAuthAccounts(db, username) {
-  await ensureOAuthTables(db);
-  const { results } = await db
-    .prepare(
-      "SELECT id, provider, provider_user_id, email, display_name, created_at FROM user_oauth_accounts WHERE username = ? ORDER BY id ASC"
-    )
-    .bind(username)
-    .all();
-  return results || [];
+  try {
+    const { results } = await db
+      .prepare(
+        "SELECT id, provider, provider_user_id, email, display_name, created_at FROM user_oauth_accounts WHERE username = ? ORDER BY id ASC"
+      )
+      .bind(username)
+      .all();
+    return results || [];
+  } catch {
+    await ensureOAuthTables(db, true);
+    return [];
+  }
 }
 
 /**
@@ -983,17 +993,35 @@ async function authenticateRequest(request, env, db) {
     };
   }
 
-  // 1. Check if token is a Personal Access Token / API key (`atk_...`)
+  // 1. Check if token is a Personal Access Token / API key (`atk_...`) via a single JOIN query
   if (token.startsWith("atk_")) {
     try {
-      await ensureSecurityTables(db);
       const keyHash = await sha256Hex(token);
-      const apiKeyRow = await db
-        .prepare("SELECT * FROM user_api_keys WHERE key_hash = ?")
-        .bind(keyHash)
-        .first();
+      let joinedRow;
+      try {
+        joinedRow = await db
+          .prepare(
+            `SELECT u.*, k.id AS api_key_id, k.expires_at AS api_key_expires_at
+             FROM user_api_keys k
+             JOIN users u ON u.username = k.username
+             WHERE k.key_hash = ?`
+          )
+          .bind(keyHash)
+          .first();
+      } catch {
+        await ensureSecurityTables(db, true);
+        joinedRow = await db
+          .prepare(
+            `SELECT u.*, k.id AS api_key_id, k.expires_at AS api_key_expires_at
+             FROM user_api_keys k
+             JOIN users u ON u.username = k.username
+             WHERE k.key_hash = ?`
+          )
+          .bind(keyHash)
+          .first();
+      }
 
-      if (!apiKeyRow) {
+      if (!joinedRow) {
         return {
           user: null,
           errorResponse: jsonResponse(
@@ -1003,7 +1031,10 @@ async function authenticateRequest(request, env, db) {
         };
       }
 
-      if (apiKeyRow.expires_at && Number(apiKeyRow.expires_at) < Date.now()) {
+      if (
+        joinedRow.api_key_expires_at &&
+        Number(joinedRow.api_key_expires_at) < Date.now()
+      ) {
         return {
           user: null,
           errorResponse: jsonResponse(
@@ -1013,22 +1044,7 @@ async function authenticateRequest(request, env, db) {
         };
       }
 
-      const user = await db
-        .prepare("SELECT * FROM users WHERE username = ?")
-        .bind(apiKeyRow.username)
-        .first();
-
-      if (!user) {
-        return {
-          user: null,
-          errorResponse: jsonResponse(
-            { error: "Unauthorized: User for API key not found" },
-            { status: 401 }
-          ),
-        };
-      }
-
-      const accountStatus = user.status || "approved";
+      const accountStatus = joinedRow.status || "approved";
       if (accountStatus !== "approved") {
         return {
           user: null,
@@ -1042,38 +1058,60 @@ async function authenticateRequest(request, env, db) {
         };
       }
 
-      await db
-        .prepare(
-          "UPDATE user_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
-        )
-        .bind(apiKeyRow.id)
-        .run();
+      // Fire-and-forget last_used_at update so it does not add write latency to the response
+      db.prepare(
+        "UPDATE user_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
+      )
+        .bind(joinedRow.api_key_id)
+        .run()
+        .catch(() => {});
 
-      user.isAdmin = isUserAdmin(user);
-      user.role = user.isAdmin ? "admin" : user.role || "user";
-      user.status = accountStatus;
-      user.authType = "api_key";
-      user.apiKeyId = apiKeyRow.id;
-      return { user, errorResponse: null };
+      joinedRow.isAdmin = isUserAdmin(joinedRow);
+      joinedRow.role = joinedRow.isAdmin ? "admin" : joinedRow.role || "user";
+      joinedRow.status = accountStatus;
+      joinedRow.authType = "api_key";
+      joinedRow.apiKeyId = joinedRow.api_key_id;
+      return { user: joinedRow, errorResponse: null };
     } catch {
       // Fall through if user_api_keys table check fails
     }
   }
 
-  // 2. Check multi-device `user_sessions` table (with 30-day expiry)
+  // 2. Check multi-device `user_sessions` table via a single JOIN query (1 D1 read instead of 3 round-trips)
   try {
-    await ensureSecurityTables(db);
-    const sessionRow = await db
-      .prepare("SELECT * FROM user_sessions WHERE token = ?")
-      .bind(token)
-      .first();
+    let joinedSession;
+    try {
+      joinedSession = await db
+        .prepare(
+          `SELECT u.*, s.id AS session_id, s.expires_at AS session_expires_at
+           FROM user_sessions s
+           JOIN users u ON u.username = s.username
+           WHERE s.token = ?`
+        )
+        .bind(token)
+        .first();
+    } catch {
+      await ensureSecurityTables(db, true);
+      joinedSession = await db
+        .prepare(
+          `SELECT u.*, s.id AS session_id, s.expires_at AS session_expires_at
+           FROM user_sessions s
+           JOIN users u ON u.username = s.username
+           WHERE s.token = ?`
+        )
+        .bind(token)
+        .first();
+    }
 
-    if (sessionRow) {
-      if (sessionRow.expires_at && Number(sessionRow.expires_at) < Date.now()) {
-        await db
-          .prepare("DELETE FROM user_sessions WHERE id = ?")
-          .bind(sessionRow.id)
-          .run();
+    if (joinedSession) {
+      if (
+        joinedSession.session_expires_at &&
+        Number(joinedSession.session_expires_at) < Date.now()
+      ) {
+        db.prepare("DELETE FROM user_sessions WHERE id = ?")
+          .bind(joinedSession.session_id)
+          .run()
+          .catch(() => {});
         return {
           user: null,
           errorResponse: jsonResponse(
@@ -1083,44 +1121,40 @@ async function authenticateRequest(request, env, db) {
         };
       }
 
-      const user = await db
-        .prepare("SELECT * FROM users WHERE username = ?")
-        .bind(sessionRow.username)
-        .first();
-
-      if (user) {
-        const accountStatus = user.status || "approved";
-        if (accountStatus !== "approved") {
-          return {
-            user: null,
-            errorResponse: jsonResponse(
-              {
-                error:
-                  accountStatus === "pending"
-                    ? "Your account is awaiting admin approval"
-                    : "Your account is not approved",
-                status: accountStatus,
-                pending_approval: accountStatus === "pending",
-              },
-              { status: 403 }
-            ),
-          };
-        }
-
-        await db
-          .prepare(
-            "UPDATE user_sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
-          )
-          .bind(sessionRow.id)
-          .run();
-
-        user.isAdmin = isUserAdmin(user);
-        user.role = user.isAdmin ? "admin" : user.role || "user";
-        user.status = accountStatus;
-        user.currentSessionToken = token;
-        user.currentSessionId = sessionRow.id;
-        return { user, errorResponse: null };
+      const accountStatus = joinedSession.status || "approved";
+      if (accountStatus !== "approved") {
+        return {
+          user: null,
+          errorResponse: jsonResponse(
+            {
+              error:
+                accountStatus === "pending"
+                  ? "Your account is awaiting admin approval"
+                  : "Your account is not approved",
+              status: accountStatus,
+              pending_approval: accountStatus === "pending",
+            },
+            { status: 403 }
+          ),
+        };
       }
+
+      // Update last_used_at asynchronously without blocking the API response
+      db.prepare(
+        "UPDATE user_sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?"
+      )
+        .bind(joinedSession.session_id)
+        .run()
+        .catch(() => {});
+
+      joinedSession.isAdmin = isUserAdmin(joinedSession);
+      joinedSession.role = joinedSession.isAdmin
+        ? "admin"
+        : joinedSession.role || "user";
+      joinedSession.status = accountStatus;
+      joinedSession.currentSessionToken = token;
+      joinedSession.currentSessionId = joinedSession.session_id;
+      return { user: joinedSession, errorResponse: null };
     }
   } catch {
     // Fall through to legacy session_token check
@@ -1331,11 +1365,15 @@ const IATA_TO_ICAO_AIRLINES = {
   JL: "JAL",
 };
 
+const FLIGHT_ROUTE_CACHE = new Map();
+const FLIGHT_ROUTE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 /**
  * Resolve a flight number / callsign (e.g., `BA968` or `BAW968`) to its origin and destination IATA codes.
- * 1. Queries the free public ADSBdb Callsign API (`https://api.adsbdb.com/v0/callsign/{CALLSIGN}`)
- *    and automatically upserts any missing origin/destination airport into the D1 `airports` reference table.
- * 2. Falls back to previously logged flights with the same `flight_number` in D1 `airport_visits`.
+ * 1. Checks the in-memory isolate flight route cache (`FLIGHT_ROUTE_CACHE`).
+ * 2. Queries the free public ADSBdb Callsign API (`https://api.adsbdb.com/v0/callsign/{CALLSIGN}`)
+ *    and automatically upserts any missing origin/destination airport into the D1 `airports` reference table in a single batch.
+ * 3. Falls back to previously logged flights with the same `flight_number` in D1 `airport_visits`.
  */
 async function resolveFlightRoute(db, rawFlightNumber) {
   const cleaned = String(rawFlightNumber || "")
@@ -1343,6 +1381,11 @@ async function resolveFlightRoute(db, rawFlightNumber) {
     .toUpperCase()
     .replace(/\s+/g, "");
   if (!cleaned) return null;
+
+  const cachedRoute = FLIGHT_ROUTE_CACHE.get(cleaned);
+  if (cachedRoute && cachedRoute.expiresAt > Date.now()) {
+    return cachedRoute.data;
+  }
 
   // Build candidate callsigns to try (e.g. BA968 -> ["BAW968", "BA968"], W43304 -> ["WMT3304", "WZZ3304", "WUK3304", "W43304"])
   const candidates = [];
@@ -1403,7 +1446,8 @@ async function resolveFlightRoute(db, rawFlightNumber) {
 
       if (!origIata && !destIata) continue;
 
-      // Auto-upsert origin and destination airports into `airports` reference table so foreign keys & distances always work
+      // Auto-upsert origin and destination airports into `airports` in a single D1 batch round-trip
+      const upsertStmts = [];
       for (const ap of [orig, dest]) {
         if (
           ap &&
@@ -1412,8 +1456,8 @@ async function resolveFlightRoute(db, rawFlightNumber) {
           ap.latitude != null &&
           ap.longitude != null
         ) {
-          try {
-            await db
+          upsertStmts.push(
+            db
               .prepare(
                 `INSERT INTO airports (iata_code, name, city, country, latitude, longitude)
                  VALUES (?, ?, ?, ?, ?, ?)
@@ -1427,14 +1471,18 @@ async function resolveFlightRoute(db, rawFlightNumber) {
                 Number(ap.latitude),
                 Number(ap.longitude)
               )
-              .run();
-          } catch {
-            // Non-fatal if airports table is read-only or unavailable
-          }
+          );
+        }
+      }
+      if (upsertStmts.length > 0) {
+        try {
+          await db.batch(upsertStmts);
+        } catch {
+          // Non-fatal if airports table is read-only or unavailable
         }
       }
 
-      return {
+      const routePayload = {
         source: "adsbdb",
         flight_number: cleaned,
         callsign_icao: route.callsign_icao || callsign,
@@ -1458,6 +1506,11 @@ async function resolveFlightRoute(db, rawFlightNumber) {
               )
             : null,
       };
+      FLIGHT_ROUTE_CACHE.set(cleaned, {
+        data: routePayload,
+        expiresAt: Date.now() + FLIGHT_ROUTE_CACHE_TTL_MS,
+      });
+      return routePayload;
     } catch {
       // Try next candidate or fall back to local D1 history
     }
@@ -3046,22 +3099,20 @@ export default {
       }
 
       try {
-        const record = await db
-          .prepare("SELECT * FROM users WHERE username = ?")
-          .bind(user.username)
-          .first();
-
-        const passkeys = await getUserPasskeys(db, user.username);
-        const oauthAccounts = await getUserOAuthAccounts(db, user.username);
-        const adminFlag = isUserAdmin(record || user);
+        // Reuse the `user` row already fetched by `authenticateRequest`, and fetch passkeys & OAuth links concurrently
+        const [passkeys, oauthAccounts] = await Promise.all([
+          getUserPasskeys(db, user.username),
+          getUserOAuthAccounts(db, user.username),
+        ]);
+        const adminFlag = isUserAdmin(user);
 
         return jsonResponse({
           username: user.username,
-          role: adminFlag ? "admin" : (record && record.role) || "user",
+          role: adminFlag ? "admin" : user.role || "user",
           is_admin: adminFlag,
-          status: (record && record.status) || "approved",
-          has_password: Boolean(record && record.password),
-          totp_enabled: Boolean(record && record.totp_secret),
+          status: user.status || "approved",
+          has_password: Boolean(user.password),
+          totp_enabled: Boolean(user.totp_secret),
           webauthn_enabled: passkeys.length > 0,
           passkey_count: passkeys.length,
           passkeys: passkeys.map((k, idx) => ({
@@ -3652,7 +3703,8 @@ export default {
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/visits") {
       try {
-        const cached = await cache.match(request);
+        const cacheKey = new Request(url.toString(), { method: "GET" });
+        const cached = await cache.match(cacheKey);
         if (cached) return cached;
 
         const username = url.searchParams.get("username");
@@ -3676,14 +3728,6 @@ export default {
 
         let results;
         try {
-          try {
-            await db
-              .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
-              .run();
-          } catch {
-            // Column already exists
-          }
-
           const query = `
             SELECT
               v.id,
@@ -3708,19 +3752,48 @@ export default {
           `;
           ({ results } = await db.prepare(query).bind(...params).all());
         } catch {
-          // Fallback if 0003 migration has not been run yet
-          const fallbackQuery = `
-            SELECT id, iata_code, airport_name, visit_date, username, notes
-            FROM airport_visits v
-            ${whereClause}
-            ORDER BY v.visit_date DESC
-            LIMIT ?
-          `;
-          ({ results } = await db.prepare(fallbackQuery).bind(...params).all());
+          try {
+            await db
+              .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+              .run();
+            const retryQuery = `
+              SELECT
+                v.id,
+                v.iata_code,
+                COALESCE(v.airport_name, a.name) AS airport_name,
+                v.visit_date,
+                v.username,
+                v.notes,
+                v.origin_iata,
+                COALESCE(v.destination_iata, v.iata_code) AS destination_iata,
+                v.flight_number,
+                v.distance_km,
+                a.city,
+                a.country,
+                a.latitude,
+                a.longitude
+              FROM airport_visits v
+              LEFT JOIN airports a ON v.iata_code = a.iata_code
+              ${whereClause}
+              ORDER BY v.visit_date DESC
+              LIMIT ?
+            `;
+            ({ results } = await db.prepare(retryQuery).bind(...params).all());
+          } catch {
+            // Fallback if 0003 migration has not been run yet
+            const fallbackQuery = `
+              SELECT id, iata_code, airport_name, visit_date, username, notes
+              FROM airport_visits v
+              ${whereClause}
+              ORDER BY v.visit_date DESC
+              LIMIT ?
+            `;
+            ({ results } = await db.prepare(fallbackQuery).bind(...params).all());
+          }
         }
 
         const response = Response.json(results, { headers: cacheHeaders() });
-        ctx.waitUntil(cache.put(request, response.clone()));
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
         return response;
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -3732,7 +3805,8 @@ export default {
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/visits/airports") {
       try {
-        const cached = await cache.match(request);
+        const cacheKey = new Request(url.toString(), { method: "GET" });
+        const cached = await cache.match(cacheKey);
         if (cached) return cached;
 
         const username = url.searchParams.get("username");
@@ -3757,7 +3831,7 @@ export default {
         const { results } = await db.prepare(query).bind(...params).all();
         const response = Response.json(results, { headers: cacheHeaders() });
 
-        ctx.waitUntil(cache.put(request, response.clone()));
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
         return response;
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -3769,7 +3843,8 @@ export default {
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/stats") {
       try {
-        const cached = await cache.match(request);
+        const cacheKey = new Request(url.toString(), { method: "GET" });
+        const cached = await cache.match(cacheKey);
         if (cached) return cached;
 
         const username = url.searchParams.get("username");
@@ -3908,7 +3983,7 @@ export default {
         };
 
         const response = Response.json(statsPayload, { headers: cacheHeaders() });
-        ctx.waitUntil(cache.put(request, response.clone()));
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
         return response;
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -3923,6 +3998,10 @@ export default {
       (url.pathname === "/api/flights" || url.pathname.startsWith("/api/flights/"))
     ) {
       try {
+        const cacheKey = new Request(url.toString(), { method: "GET" });
+        const cached = await cache.match(cacheKey);
+        if (cached) return cached;
+
         const pathFlight = url.pathname.startsWith("/api/flights/")
           ? decodeURIComponent(url.pathname.slice("/api/flights/".length))
           : null;
@@ -3949,7 +4028,9 @@ export default {
           );
         }
 
-        return jsonResponse(route);
+        const response = Response.json(route, { headers: cacheHeaders() });
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+        return response;
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
       }
@@ -3960,7 +4041,8 @@ export default {
     // =========================================================================
     if (request.method === "GET" && url.pathname === "/api/airports") {
       try {
-        const cached = await cache.match(request);
+        const cacheKey = new Request(url.toString(), { method: "GET" });
+        const cached = await cache.match(cacheKey);
         if (cached) return cached;
 
         const code = url.searchParams.get("code");
@@ -3982,7 +4064,7 @@ export default {
             nearest = nearest.filter((a) => a.distance_from_location_km <= maxKmParam);
           }
           const response = Response.json(nearest, { headers: cacheHeaders() });
-          ctx.waitUntil(cache.put(request, response.clone()));
+          ctx.waitUntil(cache.put(cacheKey, response.clone()));
           return response;
         }
 
@@ -4002,7 +4084,7 @@ export default {
 
         const { results } = await db.prepare(query).bind(...params).all();
         const response = Response.json(results, { headers: cacheHeaders() });
-        ctx.waitUntil(cache.put(request, response.clone()));
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
         return response;
       } catch (err) {
         return jsonResponse({ error: err.message }, { status: 500 });
@@ -4149,11 +4231,11 @@ export default {
             ? String(origin_iata).trim().toUpperCase()
             : null;
 
-        // 2. If a flight_number was provided, look up its origin & destination (e.g. W43304 -> LTN -> CLJ)
+        // 2. If a flight_number was provided and either origin_iata or visitedCode is missing, look up the flight route!
         //    Visited airport (`visitedCode`) stays the GPS location (e.g. LTN), while `origCode` and `flightDestCode`
         //    record the flight's origin and destination!
         let resolvedRoute = null;
-        if (cleanFlightNumber && (!origCode || !flightDestCode || !visitedCode)) {
+        if (cleanFlightNumber && (!origCode || !visitedCode)) {
           resolvedRoute = await resolveFlightRoute(db, cleanFlightNumber);
           if (resolvedRoute) {
             if (!origCode && resolvedRoute.origin_iata) {
@@ -4166,6 +4248,17 @@ export default {
               visitedCode = flightDestCode || origCode || "";
             }
           }
+        }
+
+        // If flightDestCode ended up equal to origCode while visitedCode is a different airport, use visitedCode as destination
+        if (
+          flightDestCode &&
+          origCode &&
+          flightDestCode === origCode &&
+          visitedCode &&
+          visitedCode !== origCode
+        ) {
+          flightDestCode = visitedCode;
         }
 
         // If user passed destination_iata explicitly alongside GPS without a flight lookup, GPS is the origin
@@ -4251,14 +4344,6 @@ export default {
               )
             : null;
 
-        try {
-          await db
-            .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
-            .run();
-        } catch {
-          // Column already exists
-        }
-
         let info;
         try {
           info = await db
@@ -4280,6 +4365,13 @@ export default {
             )
             .run();
         } catch {
+          try {
+            await db
+              .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+              .run();
+          } catch {
+            // Ignore if column exists
+          }
           // Fallback if destination_iata column isn't available
           info = await db
             .prepare(
@@ -4490,20 +4582,24 @@ export default {
               : null
             : existing.flight_number;
 
-        // If a flight_number is set and origin or destination is missing (or equal), resolve the flight route
-        if (nextFlightNumber && (!nextOrigin || !nextDestIata || nextOrigin === nextDestIata)) {
+        // If a flight_number is set and origin is missing, resolve the flight route
+        if (
+          nextFlightNumber &&
+          body.origin_iata === undefined &&
+          (!nextOrigin || (!nextDestIata && !nextIata))
+        ) {
           const resolvedRoute = await resolveFlightRoute(db, nextFlightNumber);
           if (resolvedRoute) {
-            if (!nextOrigin || nextOrigin === nextDestIata) {
+            if (!nextOrigin) {
               nextOrigin = resolvedRoute.origin_iata || nextOrigin;
             }
-            if (!nextDestIata || nextOrigin === nextDestIata) {
+            if (!nextDestIata) {
               nextDestIata = resolvedRoute.destination_iata || nextDestIata;
             }
           }
         }
 
-        if (!nextDestIata) {
+        if (!nextDestIata || (nextOrigin && nextDestIata === nextOrigin && nextIata !== nextOrigin)) {
           nextDestIata = nextIata;
         }
 
@@ -4557,14 +4653,6 @@ export default {
         const nextUsername =
           user.username || (body.username !== undefined ? body.username : existing.username);
 
-        try {
-          await db
-            .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
-            .run();
-        } catch {
-          // Column already exists
-        }
-
         let info;
         try {
           info = await db
@@ -4595,6 +4683,13 @@ export default {
             )
             .run();
         } catch {
+          try {
+            await db
+              .prepare("ALTER TABLE airport_visits ADD COLUMN destination_iata TEXT")
+              .run();
+          } catch {
+            // Ignore if column exists
+          }
           info = await db
             .prepare(
               `UPDATE airport_visits

@@ -57,11 +57,19 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, x-d1-bookmark",
+  "Access-Control-Expose-Headers": "x-d1-bookmark",
 };
 
+let activeD1Session = null;
+
 function jsonResponse(data, init = {}) {
+  const bookmark =
+    activeD1Session && typeof activeD1Session.getBookmark === "function"
+      ? activeD1Session.getBookmark()
+      : null;
   const headers = {
     ...CORS_HEADERS,
+    ...(bookmark ? { "x-d1-bookmark": bookmark } : {}),
     ...(init.headers || {}),
   };
   if (data && typeof data === "object" && !Array.isArray(data)) {
@@ -1696,6 +1704,7 @@ export default {
     // Use D1 Sessions API for Global Read Replication support (with fallback)
     const bookmark = request.headers.get("x-d1-bookmark") ?? "first-unconstrained";
     const db = typeof env.DB.withSession === "function" ? env.DB.withSession(bookmark) : env.DB;
+    activeD1Session = db;
 
     const cacheHeaders = () => ({
       ...CORS_HEADERS,
